@@ -1,4 +1,3 @@
-
 const mongoose = require("mongoose");
 
 const emailSchema = new mongoose.Schema(
@@ -14,7 +13,7 @@ const emailSchema = new mongoose.Schema(
     },
     recipients: {
       type: [String],
-      required: true,
+      default: [],
     },
     sentTo: {
       type: [String],
@@ -30,11 +29,7 @@ const emailSchema = new mongoose.Schema(
       default: "processing",
     },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
-module.exports =
-  mongoose.models.Email ||
-  mongoose.model("Email", emailSchema);
+module.exports = mongoose.model("Email", emailSchema);

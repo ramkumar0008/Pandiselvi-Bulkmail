@@ -1,189 +1,183 @@
-
-require("dotenv").config();
-
-const dns = require("dns");
-dns.setDefaultResultOrder("ipv4first");
-
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
-const nodemailer = require("nodemailer");
+require("dotenv").config();
+
 const Email = require("./models/Email");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const API_KEY = process.env.BREVO_API_KEY;
+const SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
+const SENDER_NAME = process.env.BREVO_SENDER_NAME || "BulkMail";
 
-let smtpReady = false;
+function normalizeEmails(value) {
+  const items = Array.isArray(value) ? value : [value];
 
-// Gmail SMTP transporter
-const transporter = nodemailer.createTransport({
-  host: "smtp.gmail.com",
-  port: 587,
-  secure: false,
-  requireTLS: true,
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
-  socketTimeout: 20000,
-  family: 4,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+  return [...new Set(
+    items
+      .flatMap((item) => String(item || "").split(/[,;\n\r]+/))
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean)
+  )];
+}
 
-// Home route
+function validEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
 app.get("/", (req, res) => {
-  res.status(200).json({
-    success: true,
-    message: "BulkMail backend is running",
-  });
+  res.json({ message: "BulkMail backend is running" });
 });
 
-// Health route
-app.get("/health", (req, res) => {
-  res.status(200).json({
-    success: true,
+function healthResponse(req, res) {
+  res.json({
     server: "running",
-    database:
-      mongoose.connection.readyState === 1
-        ? "connected"
-        : "disconnected",
-    emailService: smtpReady ? "connected" : "unavailable",
+    database: mongoose.connection.readyState === 1
+      ? "connected"
+      : "disconnected",
+    emailService: API_KEY && SENDER_EMAIL
+      ? "configured"
+      : "not configured",
   });
-});
+}
 
-app.get("/api/health", (req, res) => {
-  res.status(200).json({
-    success: true,
-    database:
-      mongoose.connection.readyState === 1
-        ? "connected"
-        : "disconnected",
-    emailService: smtpReady ? "connected" : "unavailable",
+app.get("/health", healthResponse);
+app.get("/api/health", healthResponse);
+
+async function sendWithBrevo(recipient, subject, message) {
+  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "api-key": API_KEY,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      sender: {
+        name: SENDER_NAME,
+        email: SENDER_EMAIL,
+      },
+      to: [{ email: recipient }],
+      subject,
+      textContent: message,
+    }),
+    signal: AbortSignal.timeout(20000),
   });
-});
 
-// Send bulk emails
+  const result = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const error = new Error(
+      result.message || `Brevo returned HTTP ${response.status}`
+    );
+    error.statusCode = response.status;
+    throw error;
+  }
+
+  return result.messageId || null;
+}
+
 app.post("/sendmail", async (req, res) => {
-  try {
-    const { emailList, subject, msg } = req.body;
+  let record;
 
-    if (!Array.isArray(emailList) || emailList.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Please provide at least one recipient email.",
-      });
+  try {
+    const { emailList, subject, msg } = req.body || {};
+
+    if (!subject || !String(subject).trim()) {
+      return res.status(400).json({ message: "Subject is required." });
     }
 
-    if (emailList.length > 10) {
-      return res.status(400).json({
-        success: false,
-        message: "Maximum 10 recipients are allowed per request.",
-      });
+    if (!msg || !String(msg).trim()) {
+      return res.status(400).json({ message: "Message is required." });
     }
 
     if (
-      typeof subject !== "string" ||
-      !subject.trim() ||
-      typeof msg !== "string" ||
-      !msg.trim()
+      !Array.isArray(emailList) &&
+      typeof emailList !== "string"
     ) {
       return res.status(400).json({
-        success: false,
-        message: "Subject and message are required.",
+        message: "emailList must be an array or a string.",
       });
     }
 
-    const recipients = [
-      ...new Set(
-        emailList
-          .filter((email) => typeof email === "string")
-          .map((email) => email.trim().toLowerCase())
-      ),
-    ];
+    const recipients = normalizeEmails(emailList);
 
-    if (recipients.length === 0) {
+    if (!recipients.length) {
       return res.status(400).json({
-        success: false,
-        message: "No valid recipient emails were provided.",
+        message: "Enter at least one recipient email address.",
       });
     }
 
-    const invalidEmails = recipients.filter(
-      (email) => !emailPattern.test(email)
-    );
-
-    if (invalidEmails.length > 0) {
+    if (recipients.length > 100) {
       return res.status(400).json({
-        success: false,
-        message: "Some email addresses are invalid.",
+        message: "Send no more than 100 recipients per request.",
+      });
+    }
+
+    const invalidEmails = recipients.filter((email) => !validEmail(email));
+
+    if (invalidEmails.length) {
+      return res.status(400).json({
+        message: "Invalid email addresses found.",
         invalidEmails,
       });
     }
 
-    // Save the sending request in MongoDB
-    const record = await Email.create({
-      subject: subject.trim(),
-      message: msg,
+    // Save the request first, preserving history in MongoDB.
+    record = await Email.create({
+      subject: String(subject).trim(),
+      message: String(msg),
       recipients,
       sentTo: [],
       failedTo: [],
       status: "processing",
     });
 
-    // SMTP is unavailable; retain the history record
-    if (!smtpReady) {
-      record.status = "failed";
+    if (!API_KEY || !SENDER_EMAIL) {
       record.failedTo = recipients;
+      record.status = "failed";
       await record.save();
 
       return res.status(503).json({
-        success: false,
-        message:
-          "Email service is unavailable. The request was saved to history but no emails were sent.",
-        recordId: record._id,
+        message: "Brevo is not configured. Check backend environment variables.",
+        historyId: record._id,
+        sent: 0,
+        failed: recipients.length,
       });
     }
 
-    const sentTo = [];
-    const failedTo = [];
-
-    // Send one email at a time
     for (const recipient of recipients) {
       try {
-        await transporter.sendMail({
-          from:
-            '"' +
-            "BulkMail" +
-            '" <' +
-            process.env.EMAIL_USER +
-            ">",
-          to: recipient,
-          subject: subject.trim(),
-          text: msg,
-        });
-
-        sentTo.push(recipient);
-      } catch (error) {
-        console.error(
-          "Failed to send email to " + recipient + ":",
-          error.message
+        const messageId = await sendWithBrevo(
+          recipient,
+          String(subject).trim(),
+          String(msg)
         );
-        failedTo.push(recipient);
+
+        // Brevo accepted the API request; this does not guarantee delivery.
+        record.sentTo.push(recipient);
+        console.log(`Brevo accepted email for ${recipient}: ${messageId || "accepted"}`);
+      } catch (error) {
+        record.failedTo.push(recipient);
+
+        // Log the error, never the API key.
+        console.error(
+          `Brevo failed for ${recipient}:`,
+          error.statusCode || error.message
+        );
       }
+
+      await record.save();
     }
 
-    record.sentTo = sentTo;
-    record.failedTo = failedTo;
-
-    if (sentTo.length === recipients.length) {
+    if (record.failedTo.length === 0) {
       record.status = "sent";
-    } else if (sentTo.length > 0) {
+    } else if (record.sentTo.length > 0) {
       record.status = "partial";
     } else {
       record.status = "failed";
@@ -191,92 +185,65 @@ app.post("/sendmail", async (req, res) => {
 
     await record.save();
 
-    return res.status(200).json({
-      success: failedTo.length === 0,
-      message:
-        failedTo.length === 0
-          ? "All emails sent successfully."
-          : "Email sending completed with some failures.",
-      total: recipients.length,
-      sent: sentTo.length,
-      failed: failedTo.length,
-      sentTo,
-      failedTo,
-      recordId: record._id,
+    return res.status(record.status === "sent" ? 200 : 207).json({
+      message: record.status === "sent"
+        ? "Brevo accepted all email requests."
+        : "Some or all email requests failed. Check failedTo and Render logs.",
+      historyId: record._id,
+      status: record.status,
+      sent: record.sentTo.length,
+      failed: record.failedTo.length,
+      sentTo: record.sentTo,
+      failedTo: record.failedTo,
     });
   } catch (error) {
-    console.error("Send mail error:", error.message);
+    console.error("Sendmail error:", error.message);
+
+    if (record) {
+      try {
+        record.status = "failed";
+        await record.save();
+      } catch (saveError) {
+        console.error("History update failed:", saveError.message);
+      }
+    }
 
     return res.status(500).json({
-      success: false,
-      message: "An error occurred while processing emails.",
+      message: "Unable to process the email request.",
+      historyId: record?._id,
     });
   }
 });
 
-// Retrieve email history
 app.get("/history", async (req, res) => {
   try {
-    const history = await Email.find()
+    const records = await Email.find()
       .sort({ createdAt: -1 })
-      .limit(100)
-      .lean();
+      .limit(100);
 
-    res.status(200).json({
-      success: true,
-      count: history.length,
-      history,
-    });
+    return res.json(records);
   } catch (error) {
     console.error("History error:", error.message);
-
-    res.status(500).json({
-      success: false,
+    return res.status(500).json({
       message: "Unable to retrieve email history.",
     });
   }
 });
 
-// Start the server after MongoDB connects
 async function startServer() {
-  try {
-    if (!process.env.MONGO_URI) {
-      throw new Error("MONGO_URI is missing from environment variables.");
-    }
-
-    await mongoose.connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 15000,
-    });
-
-    console.log("MongoDB connected successfully");
-
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log("BulkMail server running on port " + PORT);
-    });
-
-    // Verify SMTP separately so it cannot stop server startup
-    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
-      console.error("Email credentials are missing.");
-      return;
-    }
-
-    transporter
-      .verify()
-      .then(() => {
-        smtpReady = true;
-        console.log("Gmail SMTP connection verified");
-      })
-      .catch((error) => {
-        smtpReady = false;
-        console.error(
-          "Gmail SMTP unavailable:",
-          error.message
-        );
-      });
-  } catch (error) {
-    console.error("Server startup failed:", error.message);
-    process.exitCode = 1;
+  if (!process.env.MONGO_URI) {
+    throw new Error("MONGO_URI is missing from backend environment variables.");
   }
+
+  await mongoose.connect(process.env.MONGO_URI);
+  console.log("MongoDB connected successfully");
+
+  app.listen(PORT, () => {
+    console.log(`BulkMail server running on port ${PORT}`);
+  });
 }
 
-startServer();
+startServer().catch((error) => {
+  console.error("Server startup failed:", error.message);
+  process.exit(1);
+});

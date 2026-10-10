@@ -1,8 +1,7 @@
-
-
 {
   "name": "bulkmail-backend",
   "version": "1.0.0",
+  "description": "BulkMail backend using MongoDB and Brevo API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -12,10 +11,9 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "mongoose": "^8.9.5",
-    "nodemailer": "^6.10.0"
+    "mongoose": "^8.9.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.9"
   }
 }
