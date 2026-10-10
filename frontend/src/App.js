@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect, useCallback } from "react";
 import axios from "axios";
 import * as XLSX from "xlsx";
@@ -14,7 +15,7 @@ const API = axios.create({
 });
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const MAX_RECIPIENTS_PER_REQUEST = 10;
+const MAX_RECIPIENTS = 10;
 
 function App() {
   const [emailList, setEmailList] = useState([]);
@@ -23,7 +24,7 @@ function App() {
   const [fileName, setFileName] = useState("");
   const [feedback, setFeedback] = useState("");
   const [feedbackType, setFeedbackType] = useState("info");
-  const [status, setStatus] = useState(false);
+  const [sending, setSending] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyLoading, setHistoryLoading] = useState(false);
 
@@ -39,24 +40,19 @@ function App() {
       const response = await API.get("/history");
       const data = response.data;
 
-      let records = [];
-
       if (Array.isArray(data)) {
-        records = data;
+        setHistory(data);
       } else if (Array.isArray(data.history)) {
-        records = data.history;
+        setHistory(data.history);
       } else if (Array.isArray(data.emails)) {
-        records = data.emails;
+        setHistory(data.emails);
       } else if (Array.isArray(data.data)) {
-        records = data.data;
+        setHistory(data.data);
+      } else {
+        setHistory([]);
       }
-
-      setHistory(records);
     } catch (error) {
-      console.error(
-        "Unable to load email history:",
-        error.response?.data || error.message
-      );
+      console.error("History loading failed:", error.message);
     } finally {
       setHistoryLoading(false);
     }
@@ -71,13 +67,8 @@ function App() {
 
     if (!file) return;
 
-    const allowedExtensions = /\.(xlsx|xls|csv)$/i;
-
-    if (!allowedExtensions.test(file.name)) {
-      showFeedback(
-        "Please upload an Excel (.xlsx, .xls) or CSV (.csv) file.",
-        "error"
-      );
+    if (!/\.(xlsx|xls|csv)$/i.test(file.name)) {
+      showFeedback("Please upload an Excel or CSV file.", "error");
       event.target.value = "";
       return;
     }
@@ -85,96 +76,92 @@ function App() {
     try {
       const buffer = await file.arrayBuffer();
       const workbook = XLSX.read(buffer, { type: "array" });
-      const firstSheetName = workbook.SheetNames[0];
+      const sheetName = workbook.SheetNames[0];
 
-      if (!firstSheetName) {
-        showFeedback("The uploaded file has no worksheets.", "error");
+      if (!sheetName) {
+        showFeedback("The file contains no worksheet.", "error");
         return;
       }
 
-      const worksheet = workbook.Sheets[firstSheetName];
+      const rows = XLSX.utils.sheet_to_json(
+        workbook.Sheets[sheetName],
+        {
+          header: 1,
+          raw: false,
+          defval: "",
+        }
+      );
 
-      const rows = XLSX.utils.sheet_to_json(worksheet, {
-        header: 1,
-        raw: false,
-        defval: "",
-      });
-
-      // Read email addresses from the first column.
       const importedEmails = rows
         .map((row) => String(row[0] ?? "").trim())
         .filter(Boolean)
         .filter(
           (email) =>
-            !["email", "email address", "e-mail", "e-mail address"].includes(
-              email.toLowerCase()
-            )
+            ![
+              "email",
+              "email address",
+              "e-mail",
+              "e-mail address",
+            ].includes(email.toLowerCase())
         );
 
-      // Remove duplicates and validate addresses.
       const uniqueEmails = [
         ...new Set(importedEmails.map((email) => email.toLowerCase())),
       ];
 
-      const validEmails = uniqueEmails.filter((email) =>
+      // Use the validated list directly: no unused variable.
+      const validatedEmails = uniqueEmails.filter((email) =>
         EMAIL_REGEX.test(email)
       );
 
-      const invalidCount = uniqueEmails.length - validEmails.length;
+      const invalidCount = uniqueEmails.length - validatedEmails.length;
 
-      setEmailList(validEmails);
+      setEmailList(validatedEmails);
       setFileName(file.name);
-      setFeedbackType(validEmails.length > 0 ? "success" : "error");
 
-      if (validEmails.length > 0) {
-        setFeedback(
+      if (validatedEmails.length > 0) {
+        showFeedback(
           "Imported " +
-            validEmails.length +
+            validatedEmails.length +
             " valid email address(es)." +
-            (invalidCount > 0
+            (invalidCount
               ? " Skipped " + invalidCount + " invalid address(es)."
-              : "")
+              : ""),
+          "success"
         );
       } else {
-        setFeedback(
-          "No valid email addresses were found in the first column."
-        );
+        showFeedback("No valid email addresses were found.", "error");
       }
     } catch (error) {
-      console.error("File import error:", error);
-      showFeedback(
-        "Unable to read this file. Please check its format and try again.",
-        "error"
-      );
+      console.error("File import failed:", error);
+      showFeedback("Unable to read the file. Please try another file.", "error");
     } finally {
       event.target.value = "";
     }
   };
 
   const handleManualEmails = (event) => {
-    const value = event.target.value;
-
-    const emails = value
+    const enteredEmails = event.target.value
       .split(/[\s,;]+/)
       .map((email) => email.trim())
       .filter(Boolean);
 
-    const validEmails = [
+    const validList = [
       ...new Set(
-        emails
+        enteredEmails
           .filter((email) => EMAIL_REGEX.test(email))
           .map((email) => email.toLowerCase())
       ),
     ];
 
-    setEmailList(validEmails);
+    setEmailList(validList);
     setFileName("");
   };
 
   const clearRecipients = () => {
     setEmailList([]);
     setFileName("");
-    setFeedback("");
+    showFeedback("Recipient list cleared.", "info");
   };
 
   const handleSend = async (event) => {
@@ -191,28 +178,19 @@ function App() {
     }
 
     if (!msg.trim()) {
-      showFeedback("Please enter your email message.", "error");
+      showFeedback("Please enter an email message.", "error");
       return;
     }
 
-    setStatus(true);
-    showFeedback("Sending email requests. Please wait...", "info");
+    setSending(true);
+    showFeedback("Submitting your email requests...", "info");
 
-    let successfulBatches = 0;
+    let completedRecipients = 0;
     let failedBatches = 0;
-    let sentRequests = 0;
 
     try {
-      // The backend accepts a maximum of 10 recipients per request.
-      for (
-        let index = 0;
-        index < emailList.length;
-        index += MAX_RECIPIENTS_PER_REQUEST
-      ) {
-        const batch = emailList.slice(
-          index,
-          index + MAX_RECIPIENTS_PER_REQUEST
-        );
+      for (let i = 0; i < emailList.length; i += MAX_RECIPIENTS) {
+        const batch = emailList.slice(i, i + MAX_RECIPIENTS);
 
         const response = await API.post("/sendmail", {
           emailList: batch,
@@ -220,86 +198,62 @@ function App() {
           msg: msg.trim(),
         });
 
-        const result = response.data;
-
-        if (result?.success === false) {
+        if (response.data?.success === false) {
           failedBatches++;
           showFeedback(
-            result.message || "The email request failed.",
+            response.data.message || "The email request failed.",
             "error"
           );
           break;
         }
 
-        successfulBatches++;
-        sentRequests += batch.length;
+        completedRecipients += batch.length;
       }
 
-      if (successfulBatches > 0) {
+      if (completedRecipients > 0) {
         showFeedback(
-          "Successfully submitted " +
-            sentRequests +
-            " recipient(s) across " +
-            successfulBatches +
-            " request(s)." +
-            (failedBatches > 0
-              ? " Some requests failed. Check the email history."
-              : " Check email history for the recorded results."),
-          failedBatches > 0 ? "error" : "success"
+          "Submitted requests for " +
+            completedRecipients +
+            " recipient(s). Check email history for actual sending results." +
+            (failedBatches ? " Some requests failed." : ""),
+          failedBatches ? "error" : "success"
         );
-      }
-
-      if (successfulBatches === 0 && failedBatches === 0) {
-        showFeedback("No email requests were submitted.", "error");
       }
 
       await loadHistory();
     } catch (error) {
       console.error(
-        "Email sending error:",
+        "Email request failed:",
         error.response?.data || error.message
       );
 
-      const serverMessage = error.response?.data?.message;
-
       showFeedback(
-        serverMessage ||
-          (error.code === "ECONNABORTED"
-            ? "The request timed out. Check your email history before retrying."
-            : "Unable to reach the backend or email service. Check the backend logs and email history before retrying."),
+        error.response?.data?.message ||
+          "Email service is unavailable. Check the backend logs and history before retrying.",
         "error"
       );
 
       await loadHistory();
     } finally {
-      setStatus(false);
+      setSending(false);
     }
   };
 
-  const getRecordRecipients = (record) => {
-    if (Array.isArray(record.recipients)) {
-      return record.recipients;
-    }
-
-    if (Array.isArray(record.emailList)) {
-      return record.emailList;
-    }
-
-    if (Array.isArray(record.sentTo)) {
-      return record.sentTo;
-    }
-
+  const getRecipients = (record) => {
+    if (Array.isArray(record.recipients)) return record.recipients;
+    if (Array.isArray(record.emailList)) return record.emailList;
+    if (Array.isArray(record.sentTo)) return record.sentTo;
     return [];
   };
 
-  const formatDate = (dateValue) => {
-    if (!dateValue) return "Date unavailable";
+  const formatDate = (value) => {
+    if (!value) return "—";
 
-    const date = new Date(dateValue);
+    const date = new Date(value);
 
-    if (Number.isNaN(date.getTime())) return "Date unavailable";
-
-    return date.toLocaleString();
+    return Number.isNaN(date.getTime())
+      ? "—"
+      : date.toLocaleString();
   };
 
   return (
@@ -309,7 +263,6 @@ function App() {
           <span className="brand-icon">B</span>
           <span>BulkMail</span>
         </a>
-
         <span className="topbar-label">Email Campaign Dashboard</span>
       </header>
 
@@ -319,14 +272,11 @@ function App() {
             <p className="eyebrow">EMAIL MANAGEMENT</p>
             <h1>Send emails smarter.</h1>
             <p className="welcome-text">
-              Import your contacts, compose a message, and manage your
-              email-sending history in one place.
+              Import contacts, compose messages, and manage your email
+              request history from one dashboard.
             </p>
           </div>
-
-          <div className="welcome-icon" aria-hidden="true">
-            ✉
-          </div>
+          <div className="welcome-icon" aria-hidden="true">✉</div>
         </section>
 
         <section className="stats">
@@ -349,9 +299,8 @@ function App() {
           <article className="stat-card">
             <span className="stat-icon green">✓</span>
             <div>
-              <p>Request limit</p>
-              <h2>{MAX_RECIPIENTS_PER_REQUEST}</h2>
-              <span className="stat-caption">Recipients per request</span>
+              <p>Recipients per request</p>
+              <h2>{MAX_RECIPIENTS}</h2>
             </div>
           </article>
         </section>
@@ -381,7 +330,7 @@ function App() {
                 <p className="eyebrow">CAMPAIGN</p>
                 <h2>Compose email</h2>
                 <p className="panel-description">
-                  Upload a contact file or enter addresses manually.
+                  Upload contacts or enter email addresses manually.
                 </p>
               </div>
               <span className="heading-icon">✎</span>
@@ -393,26 +342,22 @@ function App() {
                 <label className="upload-box" htmlFor="emailFile">
                   <span className="upload-icon">↑</span>
                   <span>
-                    <strong>
-                      {fileName || "Choose a contact file"}
-                    </strong>
+                    <strong>{fileName || "Choose a contact file"}</strong>
                     <small>Excel or CSV · Emails in column A</small>
                   </span>
                   <span className="browse-button">Browse</span>
                 </label>
                 <input
                   id="emailFile"
+                  className="file-input"
                   type="file"
                   accept=".xlsx,.xls,.csv"
                   onChange={handleFileUpload}
-                  className="file-input"
                 />
               </div>
 
               <div className="field">
-                <label htmlFor="manualEmails">
-                  Or enter email addresses
-                </label>
+                <label htmlFor="manualEmails">Email addresses</label>
                 <textarea
                   id="manualEmails"
                   rows={3}
@@ -422,7 +367,6 @@ function App() {
                 />
                 <small className="helper-text">
                   Separate addresses with commas, spaces, or new lines.
-                  Duplicates are removed automatically.
                 </small>
               </div>
 
@@ -434,7 +378,7 @@ function App() {
                   type="button"
                   className="text-button"
                   onClick={clearRecipients}
-                  disabled={emailList.length === 0 || status}
+                  disabled={sending || emailList.length === 0}
                 >
                   Clear recipients
                 </button>
@@ -445,9 +389,9 @@ function App() {
                 <input
                   id="subject"
                   type="text"
-                  placeholder="Enter your email subject"
                   value={subject}
                   onChange={(event) => setSubject(event.target.value)}
+                  placeholder="Enter your email subject"
                   maxLength={200}
                   required
                 />
@@ -458,9 +402,9 @@ function App() {
                 <textarea
                   id="message"
                   rows={6}
-                  placeholder="Write your email message here..."
                   value={msg}
                   onChange={(event) => setMsg(event.target.value)}
+                  placeholder="Write your email message..."
                   required
                 />
               </div>
@@ -468,24 +412,14 @@ function App() {
               <button
                 className="send-button"
                 type="submit"
-                disabled={status || emailList.length === 0}
+                disabled={sending || emailList.length === 0}
               >
-                {status ? (
-                  <>
-                    <span className="spinner" />
-                    Processing...
-                  </>
-                ) : (
-                  <>
-                    <span>➤</span>
-                    Send email
-                  </>
-                )}
+                {sending ? "Processing..." : "➤ Send email"}
               </button>
 
               <p className="security-note">
-                Email requests are processed by your backend. Check the
-                history and backend logs to confirm the result.
+                Requests are processed by the backend. A saved history record
+                does not guarantee email delivery.
               </p>
             </form>
           </div>
@@ -498,40 +432,32 @@ function App() {
               <span className="guide-number">01</span>
               <div>
                 <h3>Import contacts</h3>
-                <p>
-                  Upload an Excel or CSV file. Email addresses are read from
-                  the first column.
-                </p>
+                <p>Upload a spreadsheet with email addresses in column A.</p>
               </div>
             </div>
 
             <div className="guide-item">
               <span className="guide-number">02</span>
               <div>
-                <h3>Compose your message</h3>
-                <p>
-                  Add a subject and message, then review the recipient count.
-                </p>
+                <h3>Compose a message</h3>
+                <p>Enter a subject and message before submitting.</p>
               </div>
             </div>
 
             <div className="guide-item">
               <span className="guide-number">03</span>
               <div>
-                <h3>Submit and review</h3>
-                <p>
-                  Requests are sent to your backend in groups of up to 10
-                  recipients.
-                </p>
+                <h3>Review history</h3>
+                <p>Check recorded results after submitting requests.</p>
               </div>
             </div>
 
             <div className="notice-card">
               <strong>Important</strong>
               <p>
-                A saved history record does not necessarily mean an email
-                was delivered. If the email service is unavailable, check
-                the backend logs before trying again.
+                Your current Render logs show a Gmail SMTP timeout. This
+                frontend update fixes the build error but cannot fix the
+                backend email connection by itself.
               </p>
             </div>
           </aside>
@@ -543,7 +469,7 @@ function App() {
               <p className="eyebrow">ACTIVITY</p>
               <h2>Email history</h2>
               <p className="panel-description">
-                Review previously submitted email requests.
+                Review previously submitted requests.
               </p>
             </div>
 
@@ -576,10 +502,9 @@ function App() {
                     <th>Date</th>
                   </tr>
                 </thead>
-
                 <tbody>
                   {history.map((record, index) => {
-                    const recipients = getRecordRecipients(record);
+                    const recipients = getRecipients(record);
                     const recordStatus = String(
                       record.status || "unknown"
                     ).toLowerCase();
@@ -594,22 +519,17 @@ function App() {
                         }
                       >
                         <td>
-                          <strong>
-                            {record.subject || "(No subject)"}
-                          </strong>
+                          <strong>{record.subject || "(No subject)"}</strong>
                           <small className="history-message">
                             {record.message || ""}
                           </small>
                         </td>
-
                         <td>
-                          {recipients.length > 0
-                            ? recipients.length
-                            : Array.isArray(record.sentTo)
+                          {recipients.length ||
+                            (Array.isArray(record.sentTo)
                               ? record.sentTo.length
-                              : "—"}
+                              : "—")}
                         </td>
-
                         <td>
                           <span
                             className={
@@ -620,7 +540,6 @@ function App() {
                             {recordStatus}
                           </span>
                         </td>
-
                         <td>{formatDate(record.createdAt)}</td>
                       </tr>
                     );
