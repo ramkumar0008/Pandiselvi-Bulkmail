@@ -1,112 +1,62 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import axios from "axios";
 import * as XLSX from "xlsx";
 import "./App.css";
 
 const API_URL = (
-  process.env.REACT_APP_API_URL || "http://localhost:5000"
+  process.env.REACT_APP_API_URL ||
+  "https://pandiselvi-bulkmail-7.onrender.com"
 ).replace(/\/+$/, "");
 
-const MAX_RECIPIENTS = 10;
+const API = axios.create({
+  baseURL: API_URL,
+  timeout: 60000,
+});
 
-function extractEmails(value) {
-  const parts = Array.isArray(value)
-    ? value
-    : String(value || "").split(/[\s,;]+/);
-
-  return parts
-    .map((item) => String(item || "").trim().replace(/^["']|["']$/g, ""))
-    .filter(Boolean);
-}
-
-function isValidEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
-
-function uniqueEmails(emails) {
-  return [...new Map(
-    emails.map((email) => [email.toLowerCase(), email])
-  ).values()];
-}
-
-function formatDate(value) {
-  if (!value) return "Just now";
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Date unavailable";
-
-  return date.toLocaleString([], {
-    dateStyle: "medium",
-    timeStyle: "short",
-  });
-}
-
-function getStatusText(status) {
-  const normalized = String(status || "").toLowerCase();
-
-  if (normalized === "sent" || normalized === "success") return "Sent";
-  if (normalized === "partial") return "Partially sent";
-  if (normalized === "failed" || normalized === "error") return "Failed";
-  if (normalized === "pending") return "Pending";
-
-  return status || "Unknown";
-}
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_RECIPIENTS_PER_REQUEST = 10;
 
 function App() {
-  const [recipientsText, setRecipientsText] = useState("");
+  const [emailList, setEmailList] = useState([]);
   const [subject, setSubject] = useState("");
-  const [message, setMessage] = useState("");
-  const [selectedFile, setSelectedFile] = useState("");
-  const [sending, setSending] = useState(false);
-  const [readingFile, setReadingFile] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [feedbackType, setFeedbackType] = useState("info");
+  const [status, setStatus] = useState(false);
   const [history, setHistory] = useState([]);
-  const [historyLoading, setHistoryLoading] = useState(true);
-  const [notice, setNotice] = useState(null);
-  const [activeView, setActiveView] = useState("compose");
-  const [searchTerm, setSearchTerm] = useState("");
-  const fileInputRef = useRef(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
-  const enteredEmails = useMemo(
-    () => extractEmails(recipientsText),
-    [recipientsText]
-  );
-
-  const recipients = useMemo(
-    () => uniqueEmails(enteredEmails),
-    [enteredEmails]
-  );
-
-  const invalidEmails = useMemo(
-    () => recipients.filter((email) => !isValidEmail(email)),
-    [recipients]
-  );
-
-  const validEmails = useMemo(
-    () => recipients.filter(isValidEmail),
-    [recipients]
-  );
-
-  const duplicateCount = enteredEmails.length - recipients.length;
-
-  const showNotice = useCallback((type, text) => {
-    setNotice({ type, text });
-  }, []);
+  const showFeedback = (message, type = "info") => {
+    setFeedback(message);
+    setFeedbackType(type);
+  };
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
 
     try {
-      const response = await axios.get(`${API_URL}/history`);
+      const response = await API.get("/history");
       const data = response.data;
 
-      const records = Array.isArray(data)
-        ? data
-        : data?.history || data?.emails || data?.records || [];
+      let records = [];
 
-      setHistory(Array.isArray(records) ? records : []);
+      if (Array.isArray(data)) {
+        records = data;
+      } else if (Array.isArray(data.history)) {
+        records = data.history;
+      } else if (Array.isArray(data.emails)) {
+        records = data.emails;
+      } else if (Array.isArray(data.data)) {
+        records = data.data;
+      }
+
+      setHistory(records);
     } catch (error) {
-      console.error("Unable to load email history:", error);
-      setHistory([]);
+      console.error(
+        "Unable to load email history:",
+        error.response?.data || error.message
+      );
     } finally {
       setHistoryLoading(false);
     }
@@ -116,20 +66,21 @@ function App() {
     loadHistory();
   }, [loadHistory]);
 
-  const handleFileChange = async (event) => {
+  const handleFileUpload = async (event) => {
     const file = event.target.files?.[0];
+
     if (!file) return;
 
-    const extension = file.name.split(".").pop().toLowerCase();
+    const allowedExtensions = /\.(xlsx|xls|csv)$/i;
 
-    if (!["xlsx", "xls", "csv"].includes(extension)) {
-      showNotice("error", "Please upload an Excel (.xlsx, .xls) or CSV file.");
+    if (!allowedExtensions.test(file.name)) {
+      showFeedback(
+        "Please upload an Excel (.xlsx, .xls) or CSV (.csv) file.",
+        "error"
+      );
       event.target.value = "";
       return;
     }
-
-    setReadingFile(true);
-    setSelectedFile(file.name);
 
     try {
       const buffer = await file.arrayBuffer();
@@ -137,702 +88,552 @@ function App() {
       const firstSheetName = workbook.SheetNames[0];
 
       if (!firstSheetName) {
-        throw new Error("The selected file does not contain a worksheet.");
-      }
-
-      const worksheet = workbook.Sheets[firstSheetName];
-      const rows = XLSX.utils.sheet_to_json(worksheet, {
-        header: 1,
-        defval: "",
-        raw: false,
-      });
-
-      const extracted = [];
-
-      rows.forEach((row, rowIndex) => {
-        if (!Array.isArray(row)) return;
-
-        // Read email addresses from the first column.
-        // A heading such as "Email" or "Email Address" is ignored.
-        const cell = String(row[0] || "").trim();
-        if (!cell) return;
-
-        if (
-          rowIndex === 0 &&
-          /^(e-?mail|email address|recipient|recipients)$/i.test(cell)
-        ) {
-          return;
-        }
-
-        extracted.push(...extractEmails(cell));
-      });
-
-      const mergedEmails = uniqueEmails([
-        ...enteredEmails,
-        ...extracted,
-      ]);
-
-      if (mergedEmails.length === 0) {
-        showNotice(
-          "error",
-          "No email addresses were found in the first column of this file."
-        );
+        showFeedback("The uploaded file has no worksheets.", "error");
         return;
       }
 
-      const limitedEmails = mergedEmails.slice(0, MAX_RECIPIENTS);
-      setRecipientsText(limitedEmails.join("\n"));
+      const worksheet = workbook.Sheets[firstSheetName];
 
-      const validCount = limitedEmails.filter(isValidEmail).length;
-      const invalidCount = limitedEmails.length - validCount;
+      const rows = XLSX.utils.sheet_to_json(worksheet, {
+        header: 1,
+        raw: false,
+        defval: "",
+      });
 
-      let result = `${limitedEmails.length} unique recipient(s) loaded.`;
+      // Read email addresses from the first column.
+      const importedEmails = rows
+        .map((row) => String(row[0] ?? "").trim())
+        .filter(Boolean)
+        .filter(
+          (email) =>
+            !["email", "email address", "e-mail", "e-mail address"].includes(
+              email.toLowerCase()
+            )
+        );
 
-      if (mergedEmails.length > MAX_RECIPIENTS) {
-        result += ` The first ${MAX_RECIPIENTS} were kept because of the recipient limit.`;
+      // Remove duplicates and validate addresses.
+      const uniqueEmails = [
+        ...new Set(importedEmails.map((email) => email.toLowerCase())),
+      ];
+
+      const validEmails = uniqueEmails.filter((email) =>
+        EMAIL_REGEX.test(email)
+      );
+
+      const invalidCount = uniqueEmails.length - validEmails.length;
+
+      setEmailList(validEmails);
+      setFileName(file.name);
+      setFeedbackType(validEmails.length > 0 ? "success" : "error");
+
+      if (validEmails.length > 0) {
+        setFeedback(
+          "Imported " +
+            validEmails.length +
+            " valid email address(es)." +
+            (invalidCount > 0
+              ? " Skipped " + invalidCount + " invalid address(es)."
+              : "")
+        );
+      } else {
+        setFeedback(
+          "No valid email addresses were found in the first column."
+        );
       }
-
-      if (invalidCount > 0) {
-        result += ` ${invalidCount} address(es) need correction.`;
-      } else if (validCount > 0) {
-        result += " Ready to review.";
-      }
-
-      showNotice("success", result);
     } catch (error) {
-      console.error("File reading error:", error);
-      showNotice(
-        "error",
-        error.message || "Unable to read this file. Please check its format."
+      console.error("File import error:", error);
+      showFeedback(
+        "Unable to read this file. Please check its format and try again.",
+        "error"
       );
     } finally {
-      setReadingFile(false);
       event.target.value = "";
     }
+  };
+
+  const handleManualEmails = (event) => {
+    const value = event.target.value;
+
+    const emails = value
+      .split(/[\s,;]+/)
+      .map((email) => email.trim())
+      .filter(Boolean);
+
+    const validEmails = [
+      ...new Set(
+        emails
+          .filter((email) => EMAIL_REGEX.test(email))
+          .map((email) => email.toLowerCase())
+      ),
+    ];
+
+    setEmailList(validEmails);
+    setFileName("");
+  };
+
+  const clearRecipients = () => {
+    setEmailList([]);
+    setFileName("");
+    setFeedback("");
   };
 
   const handleSend = async (event) => {
     event.preventDefault();
 
-    if (sending) return;
-
-    if (recipients.length === 0) {
-      showNotice("error", "Add at least one recipient email address.");
-      return;
-    }
-
-    if (recipients.length > MAX_RECIPIENTS) {
-      showNotice(
-        "error",
-        `You can send to a maximum of ${MAX_RECIPIENTS} recipients at a time.`
-      );
-      return;
-    }
-
-    if (invalidEmails.length > 0) {
-      showNotice(
-        "error",
-        `Please correct these email addresses: ${invalidEmails.join(", ")}`
-      );
+    if (emailList.length === 0) {
+      showFeedback("Please upload a file or enter valid email addresses.", "error");
       return;
     }
 
     if (!subject.trim()) {
-      showNotice("error", "Please enter an email subject.");
+      showFeedback("Please enter an email subject.", "error");
       return;
     }
 
-    if (!message.trim()) {
-      showNotice("error", "Please enter your email message.");
+    if (!msg.trim()) {
+      showFeedback("Please enter your email message.", "error");
       return;
     }
 
-    setSending(true);
-    showNotice("loading", "Sending your emails...");
+    setStatus(true);
+    showFeedback("Sending email requests. Please wait...", "info");
+
+    let successfulBatches = 0;
+    let failedBatches = 0;
+    let sentRequests = 0;
 
     try {
-      const response = await axios.post(`${API_URL}/sendmail`, {
-        subject: subject.trim(),
-        body: message.trim(),
-        recipients,
-      });
-
-      const data = response.data || {};
-      const successCount = Number(
-        data.successfulRecipients?.length ??
-        data.successful ??
-        data.sent ??
-        data.sentCount ??
-        0
-      );
-
-      const failedCount = Number(
-        data.failedRecipients?.length ??
-        data.failed ??
-        data.failedCount ??
-        0
-      );
-
-      const serverMessage = String(data.message || "");
-
-      if (
-        failedCount > 0 ||
-        String(data.status || "").toLowerCase() === "failed" ||
-        String(data.status || "").toLowerCase() === "partial"
+      // The backend accepts a maximum of 10 recipients per request.
+      for (
+        let index = 0;
+        index < emailList.length;
+        index += MAX_RECIPIENTS_PER_REQUEST
       ) {
-        showNotice(
-          "error",
-          serverMessage ||
-            `Sending finished. Sent: ${successCount}; failed: ${failedCount}.`
+        const batch = emailList.slice(
+          index,
+          index + MAX_RECIPIENTS_PER_REQUEST
         );
-      } else {
-        showNotice(
-          "success",
-          serverMessage ||
-            `Emails submitted successfully. Sent: ${successCount}; failed: ${failedCount}.`
+
+        const response = await API.post("/sendmail", {
+          emailList: batch,
+          subject: subject.trim(),
+          msg: msg.trim(),
+        });
+
+        const result = response.data;
+
+        if (result?.success === false) {
+          failedBatches++;
+          showFeedback(
+            result.message || "The email request failed.",
+            "error"
+          );
+          break;
+        }
+
+        successfulBatches++;
+        sentRequests += batch.length;
+      }
+
+      if (successfulBatches > 0) {
+        showFeedback(
+          "Successfully submitted " +
+            sentRequests +
+            " recipient(s) across " +
+            successfulBatches +
+            " request(s)." +
+            (failedBatches > 0
+              ? " Some requests failed. Check the email history."
+              : " Check email history for the recorded results."),
+          failedBatches > 0 ? "error" : "success"
         );
       }
 
-      setSubject("");
-      setMessage("");
+      if (successfulBatches === 0 && failedBatches === 0) {
+        showFeedback("No email requests were submitted.", "error");
+      }
+
       await loadHistory();
-      setActiveView("compose");
     } catch (error) {
-      console.error("Email sending error:", error);
+      console.error(
+        "Email sending error:",
+        error.response?.data || error.message
+      );
 
-      const serverMessage =
-        error.response?.data?.message ||
-        error.response?.data?.error ||
-        error.message ||
-        "Unable to send emails.";
+      const serverMessage = error.response?.data?.message;
 
-      showNotice("error", serverMessage);
+      showFeedback(
+        serverMessage ||
+          (error.code === "ECONNABORTED"
+            ? "The request timed out. Check your email history before retrying."
+            : "Unable to reach the backend or email service. Check the backend logs and email history before retrying."),
+        "error"
+      );
+
+      await loadHistory();
     } finally {
-      setSending(false);
+      setStatus(false);
     }
   };
 
-  const filteredHistory = useMemo(() => {
-    const query = searchTerm.trim().toLowerCase();
-    if (!query) return history;
-
-    return history.filter((item) => {
-      const recipientsValue = Array.isArray(item.recipients)
-        ? item.recipients.join(" ")
-        : String(item.recipients || "");
-
-      return [
-        item.subject,
-        item.body,
-        item.status,
-        recipientsValue,
-      ].some((value) => String(value || "").toLowerCase().includes(query));
-    });
-  }, [history, searchTerm]);
-
-  const totalRecipientsSent = history.reduce((total, item) => {
-    const successful = Array.isArray(item.successfulRecipients)
-      ? item.successfulRecipients.length
-      : Number(item.successful || item.sent || 0);
-
-    return total + successful;
-  }, 0);
-
-  const successfulCampaigns = history.filter(
-    (item) => String(item.status || "").toLowerCase() === "sent"
-  ).length;
-
-  const handleClearForm = () => {
-    setRecipientsText("");
-    setSubject("");
-    setMessage("");
-    setSelectedFile("");
-    setNotice(null);
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = "";
+  const getRecordRecipients = (record) => {
+    if (Array.isArray(record.recipients)) {
+      return record.recipients;
     }
+
+    if (Array.isArray(record.emailList)) {
+      return record.emailList;
+    }
+
+    if (Array.isArray(record.sentTo)) {
+      return record.sentTo;
+    }
+
+    return [];
+  };
+
+  const formatDate = (dateValue) => {
+    if (!dateValue) return "Date unavailable";
+
+    const date = new Date(dateValue);
+
+    if (Number.isNaN(date.getTime())) return "Date unavailable";
+
+    return date.toLocaleString();
   };
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <a className="brand" href="#dashboard" onClick={() => setActiveView("compose")}>
-          <span className="brand-mark">
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M3 6.5 12 13l9-6.5" />
-              <rect x="3" y="5" width="18" height="14" rx="3" />
-              <path d="m4 18 6-5m10 5-6-5" />
-            </svg>
-          </span>
-          <span className="brand-name">Bulk<span>Mail</span></span>
+    <div className="app">
+      <header className="topbar">
+        <a className="brand" href="/" aria-label="BulkMail home">
+          <span className="brand-icon">B</span>
+          <span>BulkMail</span>
         </a>
 
-        <div className="workspace-label">WORKSPACE</div>
+        <span className="topbar-label">Email Campaign Dashboard</span>
+      </header>
 
-        <nav className="sidebar-nav" aria-label="Main navigation">
-          <button
-            className={`nav-item ${activeView === "compose" ? "active" : ""}`}
-            onClick={() => setActiveView("compose")}
-            type="button"
-          >
-            <span className="nav-icon">✉</span>
-            <span>Compose email</span>
-          </button>
-
-          <button
-            className={`nav-item ${activeView === "history" ? "active" : ""}`}
-            onClick={() => {
-              setActiveView("history");
-              loadHistory();
-            }}
-            type="button"
-          >
-            <span className="nav-icon">◷</span>
-            <span>Email history</span>
-            <span className="nav-count">{history.length}</span>
-          </button>
-        </nav>
-
-        <div className="sidebar-bottom">
-          <div className="help-card">
-            <div className="help-icon">✦</div>
-            <strong>Bulk emailing, simplified.</strong>
-            <p>Import your contacts, write your message, and send.</p>
-          </div>
-
-          <div className="connection-status">
-            <span className="status-dot" />
-            <span>Local workspace</span>
-          </div>
-          <div className="sidebar-version">BULKMAIL WORKSPACE</div>
-        </div>
-      </aside>
-
-      <main className="main-panel">
-        <header className="topbar">
+      <main className="container">
+        <section className="welcome">
           <div>
-            <div className="breadcrumb">Workspace <span>/</span> {activeView === "history" ? "Email history" : "Compose"}</div>
-            <h1>{activeView === "history" ? "Email history" : "Email campaign"}</h1>
+            <p className="eyebrow">EMAIL MANAGEMENT</p>
+            <h1>Send emails smarter.</h1>
+            <p className="welcome-text">
+              Import your contacts, compose a message, and manage your
+              email-sending history in one place.
+            </p>
           </div>
 
-          <div className="topbar-right">
-            <span className="backend-indicator">
-              <span className="status-dot" />
-              Backend connected
-            </span>
-            <div className="avatar" aria-label="BulkMail account">B</div>
+          <div className="welcome-icon" aria-hidden="true">
+            ✉
           </div>
-        </header>
+        </section>
 
-        {notice && (
+        <section className="stats">
+          <article className="stat-card">
+            <span className="stat-icon purple">✉</span>
+            <div>
+              <p>Valid recipients</p>
+              <h2>{emailList.length}</h2>
+            </div>
+          </article>
+
+          <article className="stat-card">
+            <span className="stat-icon blue">▤</span>
+            <div>
+              <p>History records</p>
+              <h2>{history.length}</h2>
+            </div>
+          </article>
+
+          <article className="stat-card">
+            <span className="stat-icon green">✓</span>
+            <div>
+              <p>Request limit</p>
+              <h2>{MAX_RECIPIENTS_PER_REQUEST}</h2>
+              <span className="stat-caption">Recipients per request</span>
+            </div>
+          </article>
+        </section>
+
+        {feedback && (
           <div
-            className={`notice notice-${notice.type}`}
-            role={notice.type === "error" ? "alert" : "status"}
+            className={"feedback " + feedbackType}
+            role="status"
+            aria-live="polite"
           >
-            <span className="notice-symbol">
-              {notice.type === "loading"
-                ? "◌"
-                : notice.type === "error"
-                ? "!"
-                : "✓"}
-            </span>
-            <span>{notice.text}</span>
+            <span>{feedback}</span>
             <button
-              className="notice-close"
               type="button"
-              aria-label="Dismiss notification"
-              onClick={() => setNotice(null)}
+              className="feedback-close"
+              onClick={() => setFeedback("")}
+              aria-label="Dismiss message"
             >
               ×
             </button>
           </div>
         )}
 
-        <section className="stats-grid" aria-label="Email statistics">
-          <article className="stat-card">
-            <div className="stat-top">
-              <span className="stat-label">Campaigns</span>
-              <span className="stat-icon purple">✉</span>
+        <section className="content-grid">
+          <div className="panel compose-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">CAMPAIGN</p>
+                <h2>Compose email</h2>
+                <p className="panel-description">
+                  Upload a contact file or enter addresses manually.
+                </p>
+              </div>
+              <span className="heading-icon">✎</span>
             </div>
-            <div className="stat-value">{history.length}</div>
-            <div className="stat-foot">Total email records</div>
-          </article>
 
-          <article className="stat-card">
-            <div className="stat-top">
-              <span className="stat-label">Successful campaigns</span>
-              <span className="stat-icon green">✓</span>
-            </div>
-            <div className="stat-value">{successfulCampaigns}</div>
-            <div className="stat-foot">Marked as sent</div>
-          </article>
-
-          <article className="stat-card">
-            <div className="stat-top">
-              <span className="stat-label">Recipients sent</span>
-              <span className="stat-icon blue">↗</span>
-            </div>
-            <div className="stat-value">{totalRecipientsSent}</div>
-            <div className="stat-foot">Based on recorded history</div>
-          </article>
-
-          <article className="stat-card">
-            <div className="stat-top">
-              <span className="stat-label">Current recipients</span>
-              <span className="stat-icon orange">◎</span>
-            </div>
-            <div className="stat-value">{recipients.length}<span className="stat-limit"> / {MAX_RECIPIENTS}</span></div>
-            <div className="stat-foot">Per sending request</div>
-          </article>
-        </section>
-
-        {activeView === "compose" ? (
-          <div className="content-grid">
-            <section className="panel compose-panel">
-              <div className="panel-heading">
-                <div>
-                  <div className="eyebrow">NEW CAMPAIGN</div>
-                  <h2>Compose your email</h2>
-                  <p>Create your message and choose your recipients.</p>
-                </div>
-                <div className="heading-icon">✎</div>
+            <form onSubmit={handleSend}>
+              <div className="field">
+                <label htmlFor="emailFile">Upload Excel or CSV file</label>
+                <label className="upload-box" htmlFor="emailFile">
+                  <span className="upload-icon">↑</span>
+                  <span>
+                    <strong>
+                      {fileName || "Choose a contact file"}
+                    </strong>
+                    <small>Excel or CSV · Emails in column A</small>
+                  </span>
+                  <span className="browse-button">Browse</span>
+                </label>
+                <input
+                  id="emailFile"
+                  type="file"
+                  accept=".xlsx,.xls,.csv"
+                  onChange={handleFileUpload}
+                  className="file-input"
+                />
               </div>
 
-              <form onSubmit={handleSend} noValidate>
-                <div className="field-group">
-                  <div className="field-label-row">
-                    <label htmlFor="recipients">Recipients</label>
-                    <span className="field-hint">Up to {MAX_RECIPIENTS} addresses</span>
-                  </div>
+              <div className="field">
+                <label htmlFor="manualEmails">
+                  Or enter email addresses
+                </label>
+                <textarea
+                  id="manualEmails"
+                  rows={3}
+                  placeholder="example@gmail.com, another@example.com"
+                  value={emailList.join(", ")}
+                  onChange={handleManualEmails}
+                />
+                <small className="helper-text">
+                  Separate addresses with commas, spaces, or new lines.
+                  Duplicates are removed automatically.
+                </small>
+              </div>
 
-                  <div className="recipient-box">
-                    <div className="recipient-box-top">
-                      <span className="recipient-caption">TO</span>
-                      <span className={`recipient-count ${recipients.length >= MAX_RECIPIENTS ? "limit-reached" : ""}`}>
-                        {recipients.length} / {MAX_RECIPIENTS}
-                      </span>
-                    </div>
-                    <textarea
-                      id="recipients"
-                      value={recipientsText}
-                      onChange={(event) => setRecipientsText(event.target.value)}
-                      placeholder={"Enter email addresses separated by commas or new lines\nexample@email.com"}
-                      rows={4}
-                      aria-describedby="recipient-help"
-                    />
-                    <div className="recipient-box-footer">
-                      <span id="recipient-help">
-                        {duplicateCount > 0
-                          ? `${duplicateCount} duplicate address(es) will be removed.`
-                          : "Paste addresses or import a contact list."}
-                      </span>
-                      <button
-                        type="button"
-                        className="text-button"
-                        onClick={() => fileInputRef.current?.click()}
-                        disabled={readingFile}
-                      >
-                        {readingFile ? "Reading..." : "+ Import file"}
-                      </button>
-                    </div>
-                  </div>
-
-                  <input
-                    ref={fileInputRef}
-                    className="visually-hidden"
-                    type="file"
-                    accept=".xlsx,.xls,.csv"
-                    onChange={handleFileChange}
-                  />
-
-                  {selectedFile && (
-                    <div className="file-chip">
-                      <span className="file-chip-icon">▤</span>
-                      <span className="file-chip-name">{selectedFile}</span>
-                      <span className="file-chip-detail">{recipients.length} unique address(es)</span>
-                      <button
-                        type="button"
-                        aria-label="Remove imported file name"
-                        onClick={() => setSelectedFile("")}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  )}
-
-                  {invalidEmails.length > 0 && (
-                    <div className="inline-warning">
-                      {invalidEmails.length} invalid address(es) need correction before sending.
-                    </div>
-                  )}
-                </div>
-
-                <div className="field-group">
-                  <label htmlFor="subject">Email subject</label>
-                  <input
-                    id="subject"
-                    type="text"
-                    value={subject}
-                    onChange={(event) => setSubject(event.target.value)}
-                    placeholder="e.g. An update from our team"
-                    maxLength={200}
-                  />
-                  <div className="character-count">{subject.length}/200</div>
-                </div>
-
-                <div className="field-group">
-                  <div className="field-label-row">
-                    <label htmlFor="message">Message</label>
-                    <span className="field-hint">Plain text email</span>
-                  </div>
-                  <textarea
-                    id="message"
-                    className="message-textarea"
-                    value={message}
-                    onChange={(event) => setMessage(event.target.value)}
-                    placeholder={"Hi there,\n\nWrite your email message here...\n\nBest regards"}
-                    rows={8}
-                  />
-                  <div className="character-count">{message.length} characters</div>
-                </div>
-
-                <div className="form-footer">
-                  <div className="secure-note">
-                    <span>▣</span> Sent through your configured email account
-                  </div>
-                  <div className="form-actions">
-                    <button
-                      type="button"
-                      className="button button-secondary"
-                      onClick={handleClearForm}
-                      disabled={sending}
-                    >
-                      Clear form
-                    </button>
-                    <button
-                      type="submit"
-                      className="button button-primary"
-                      disabled={sending || readingFile}
-                    >
-                      {sending ? (
-                        <>
-                          <span className="button-spinner" />
-                          Sending...
-                        </>
-                      ) : (
-                        <>
-                          <span>➤</span>
-                          Send emails
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </section>
-
-            <aside className="right-column">
-              <section className="panel import-panel">
-                <div className="side-panel-title">
-                  <span className="side-title-icon">⇧</span>
-                  <div>
-                    <h3>Import contacts</h3>
-                    <p>Upload your recipient list</p>
-                  </div>
-                </div>
-
+              <div className="recipient-summary">
+                <span>
+                  <strong>{emailList.length}</strong> valid recipient(s)
+                </span>
                 <button
                   type="button"
-                  className="upload-zone"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={readingFile}
+                  className="text-button"
+                  onClick={clearRecipients}
+                  disabled={emailList.length === 0 || status}
                 >
-                  <span className="upload-icon">↑</span>
-                  <strong>{readingFile ? "Reading your file..." : "Choose a file to upload"}</strong>
-                  <span>Excel or CSV · First column</span>
-                  <span className="upload-browse">Browse files</span>
+                  Clear recipients
                 </button>
-
-                <div className="supported-files">
-                  <span className="file-type-badge">XLSX</span>
-                  <span className="file-type-badge">XLS</span>
-                  <span className="file-type-badge">CSV</span>
-                  <span>Max {MAX_RECIPIENTS} unique recipients per send</span>
-                </div>
-
-                <div className="tip-box">
-                  <span className="tip-star">✦</span>
-                  <div>
-                    <strong>Quick tip</strong>
-                    <p>Keep email addresses in the first column of your spreadsheet. A heading such as “Email” is supported.</p>
-                  </div>
-                </div>
-              </section>
-
-              <section className="panel recent-panel">
-                <div className="recent-heading">
-                  <div>
-                    <h3>Recent activity</h3>
-                    <p>Your latest email records</p>
-                  </div>
-                  <button
-                    className="text-button"
-                    type="button"
-                    onClick={() => {
-                      setActiveView("history");
-                      loadHistory();
-                    }}
-                  >
-                    View all
-                  </button>
-                </div>
-
-                {historyLoading ? (
-                  <div className="empty-state small-empty">
-                    <span className="loading-ring" />
-                    <p>Loading history...</p>
-                  </div>
-                ) : history.length === 0 ? (
-                  <div className="empty-state small-empty">
-                    <span className="empty-icon">◷</span>
-                    <strong>No activity yet</strong>
-                    <p>Your email records will appear here.</p>
-                  </div>
-                ) : (
-                  <div className="recent-list">
-                    {history.slice(0, 4).map((item, index) => (
-                      <div className="recent-item" key={item._id || item.id || `${item.subject}-${index}`}>
-                        <span className="recent-item-icon">✉</span>
-                        <div className="recent-item-main">
-                          <strong>{item.subject || "Untitled email"}</strong>
-                          <span>{formatDate(item.createdAt || item.date)}</span>
-                        </div>
-                        <span className={`status-pill status-${String(item.status || "pending").toLowerCase()}`}>
-                          {getStatusText(item.status)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </section>
-            </aside>
-          </div>
-        ) : (
-          <section className="panel history-panel">
-            <div className="history-heading">
-              <div>
-                <div className="eyebrow">CAMPAIGN RECORDS</div>
-                <h2>All email activity</h2>
-                <p>Review your recorded sending attempts.</p>
               </div>
+
+              <div className="field">
+                <label htmlFor="subject">Email subject</label>
+                <input
+                  id="subject"
+                  type="text"
+                  placeholder="Enter your email subject"
+                  value={subject}
+                  onChange={(event) => setSubject(event.target.value)}
+                  maxLength={200}
+                  required
+                />
+              </div>
+
+              <div className="field">
+                <label htmlFor="message">Email message</label>
+                <textarea
+                  id="message"
+                  rows={6}
+                  placeholder="Write your email message here..."
+                  value={msg}
+                  onChange={(event) => setMsg(event.target.value)}
+                  required
+                />
+              </div>
+
               <button
-                className="button button-secondary"
-                type="button"
-                onClick={loadHistory}
-                disabled={historyLoading}
+                className="send-button"
+                type="submit"
+                disabled={status || emailList.length === 0}
               >
-                ↻ Refresh
-              </button>
-            </div>
-
-            <div className="history-search">
-              <span>⌕</span>
-              <input
-                type="search"
-                placeholder="Search subject, recipient, or status..."
-                value={searchTerm}
-                onChange={(event) => setSearchTerm(event.target.value)}
-              />
-            </div>
-
-            {historyLoading ? (
-              <div className="empty-state">
-                <span className="loading-ring" />
-                <strong>Loading email history</strong>
-                <p>Please wait while your records load.</p>
-              </div>
-            ) : filteredHistory.length === 0 ? (
-              <div className="empty-state">
-                <span className="empty-icon">◷</span>
-                <strong>{searchTerm ? "No matching records" : "No email history yet"}</strong>
-                <p>{searchTerm ? "Try a different search term." : "After sending emails, your records will appear here."}</p>
-                {searchTerm && (
-                  <button
-                    className="text-button"
-                    type="button"
-                    onClick={() => setSearchTerm("")}
-                  >
-                    Clear search
-                  </button>
+                {status ? (
+                  <>
+                    <span className="spinner" />
+                    Processing...
+                  </>
+                ) : (
+                  <>
+                    <span>➤</span>
+                    Send email
+                  </>
                 )}
-              </div>
-            ) : (
-              <div className="table-scroll">
-                <table className="history-table">
-                  <thead>
-                    <tr>
-                      <th>Subject</th>
-                      <th>Recipients</th>
-                      <th>Status</th>
-                      <th>Date</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {filteredHistory.map((item, index) => {
-                      const recipientList = Array.isArray(item.recipients)
-                        ? item.recipients
-                        : item.recipients
-                        ? [item.recipients]
-                        : [];
+              </button>
 
-                      return (
-                        <tr key={item._id || item.id || `${item.subject}-${index}`}>
-                          <td>
-                            <div className="table-subject">{item.subject || "Untitled email"}</div>
-                            <div className="table-subtitle">
-                              {item.body
-                                ? `${String(item.body).slice(0, 70)}${String(item.body).length > 70 ? "…" : ""}`
-                                : "No message preview"}
-                            </div>
-                          </td>
-                          <td>
-                            <div className="recipient-cell">
-                              <span className="recipient-mini-icon">✉</span>
-                              <span>
-                                {recipientList.length
-                                  ? `${recipientList.length} recipient(s)`
-                                  : "Not recorded"}
-                              </span>
-                            </div>
-                            {recipientList.length > 0 && (
-                              <div className="table-subtitle recipient-preview">
-                                {recipientList.slice(0, 2).join(", ")}
-                                {recipientList.length > 2 ? "…" : ""}
-                              </div>
-                            )}
-                          </td>
-                          <td>
-                            <span className={`status-pill status-${String(item.status || "pending").toLowerCase()}`}>
-                              {getStatusText(item.status)}
-                            </span>
-                          </td>
-                          <td className="date-cell">
-                            {formatDate(item.createdAt || item.date)}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-        )}
+              <p className="security-note">
+                Email requests are processed by your backend. Check the
+                history and backend logs to confirm the result.
+              </p>
+            </form>
+          </div>
 
-        <footer className="app-footer">
-          <span>© {new Date().getFullYear()} BulkMail</span>
-          <span><span className="status-dot" /> Your email workspace</span>
+          <aside className="panel info-panel">
+            <p className="eyebrow">QUICK GUIDE</p>
+            <h2>How it works</h2>
+
+            <div className="guide-item">
+              <span className="guide-number">01</span>
+              <div>
+                <h3>Import contacts</h3>
+                <p>
+                  Upload an Excel or CSV file. Email addresses are read from
+                  the first column.
+                </p>
+              </div>
+            </div>
+
+            <div className="guide-item">
+              <span className="guide-number">02</span>
+              <div>
+                <h3>Compose your message</h3>
+                <p>
+                  Add a subject and message, then review the recipient count.
+                </p>
+              </div>
+            </div>
+
+            <div className="guide-item">
+              <span className="guide-number">03</span>
+              <div>
+                <h3>Submit and review</h3>
+                <p>
+                  Requests are sent to your backend in groups of up to 10
+                  recipients.
+                </p>
+              </div>
+            </div>
+
+            <div className="notice-card">
+              <strong>Important</strong>
+              <p>
+                A saved history record does not necessarily mean an email
+                was delivered. If the email service is unavailable, check
+                the backend logs before trying again.
+              </p>
+            </div>
+          </aside>
+        </section>
+
+        <section className="panel history-panel">
+          <div className="history-heading">
+            <div>
+              <p className="eyebrow">ACTIVITY</p>
+              <h2>Email history</h2>
+              <p className="panel-description">
+                Review previously submitted email requests.
+              </p>
+            </div>
+
+            <button
+              type="button"
+              className="refresh-button"
+              onClick={loadHistory}
+              disabled={historyLoading}
+            >
+              {historyLoading ? "Refreshing..." : "↻ Refresh"}
+            </button>
+          </div>
+
+          {historyLoading && history.length === 0 ? (
+            <div className="empty-state">Loading email history...</div>
+          ) : history.length === 0 ? (
+            <div className="empty-state">
+              <span className="empty-icon">▤</span>
+              <h3>No email history yet</h3>
+              <p>Your submitted email requests will appear here.</p>
+            </div>
+          ) : (
+            <div className="table-wrapper">
+              <table className="history-table">
+                <thead>
+                  <tr>
+                    <th>Subject</th>
+                    <th>Recipients</th>
+                    <th>Status</th>
+                    <th>Date</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {history.map((record, index) => {
+                    const recipients = getRecordRecipients(record);
+                    const recordStatus = String(
+                      record.status || "unknown"
+                    ).toLowerCase();
+
+                    return (
+                      <tr
+                        key={
+                          record._id ||
+                          record.id ||
+                          record.createdAt ||
+                          index
+                        }
+                      >
+                        <td>
+                          <strong>
+                            {record.subject || "(No subject)"}
+                          </strong>
+                          <small className="history-message">
+                            {record.message || ""}
+                          </small>
+                        </td>
+
+                        <td>
+                          {recipients.length > 0
+                            ? recipients.length
+                            : Array.isArray(record.sentTo)
+                              ? record.sentTo.length
+                              : "—"}
+                        </td>
+
+                        <td>
+                          <span
+                            className={
+                              "status-pill status-" +
+                              recordStatus.replace(/[^a-z0-9-]/g, "")
+                            }
+                          >
+                            {recordStatus}
+                          </span>
+                        </td>
+
+                        <td>{formatDate(record.createdAt)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        <footer className="footer">
+          <span>BulkMail</span>
+          <span>Email management dashboard</span>
         </footer>
       </main>
     </div>
