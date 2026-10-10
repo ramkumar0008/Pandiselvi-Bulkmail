@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const express = require("express");
@@ -12,26 +13,37 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Validate email addresses
+// Email validation
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Configure Gmail
+// Gmail SMTP: port 587 with STARTTLS and IPv4 preference
 const transporter = nodemailer.createTransport({
-  service: "gmail",
+  host: "smtp.gmail.com",
+  port: 587,
+  secure: false,
+  requireTLS: true,
+  family: 4,
   auth: {
     user: process.env.EMAIL_USER,
     pass: process.env.EMAIL_PASS,
   },
+  connectionTimeout: 20000,
+  greetingTimeout: 20000,
+  socketTimeout: 30000,
 });
 
 // Home route
 app.get("/", (req, res) => {
-  res.json({ message: "BulkMail API is running" });
+  res.status(200).json({
+    success: true,
+    message: "BulkMail API is running",
+  });
 });
 
 // Health check
 app.get("/health", (req, res) => {
-  res.json({
+  res.status(200).json({
+    success: true,
     server: "running",
     database:
       mongoose.connection.readyState === 1
@@ -42,143 +54,133 @@ app.get("/health", (req, res) => {
 
 // Send bulk emails
 app.post("/sendmail", async (req, res) => {
-  let record;
-
   try {
-    const { subject, body, recipients } = req.body;
+    const { subject, message, body, recipients, emails } = req.body;
 
-    if (
-      typeof subject !== "string" ||
-      typeof body !== "string" ||
-      !subject.trim() ||
-      !body.trim() ||
-      !Array.isArray(recipients)
-    ) {
-      return res.status(400).json({
-        message: "Subject, message body and recipient list are required.",
-      });
+    const emailSubject =
+      typeof subject === "string" ? subject.trim() : "";
+
+    const emailBody =
+      typeof message === "string"
+        ? message.trim()
+        : typeof body === "string"
+        ? body.trim()
+        : "";
+
+    const recipientInput = recipients ?? emails;
+
+    let recipientList = [];
+
+    if (Array.isArray(recipientInput)) {
+      recipientList = recipientInput;
+    } else if (typeof recipientInput === "string") {
+      recipientList = recipientInput.split(/[\s,;]+/);
     }
 
-    // Remove duplicate and empty email addresses
-    const emails = [
+    recipientList = [
       ...new Set(
-        recipients
-          .filter((email) => typeof email === "string")
-          .map((email) => email.trim().toLowerCase())
+        recipientList
+          .map((email) =>
+            typeof email === "string"
+              ? email.trim().toLowerCase()
+              : ""
+          )
           .filter(Boolean)
       ),
     ];
 
-    if (emails.length === 0) {
+    if (!emailSubject || !emailBody || recipientList.length === 0) {
       return res.status(400).json({
-        message: "Add at least one recipient email.",
+        success: false,
+        message: "Subject, message, and recipients are required.",
       });
     }
 
-    // Limit each request to 10 recipients
-    if (emails.length > 10) {
+    if (recipientList.some((email) => !emailPattern.test(email))) {
       return res.status(400).json({
-        message: "Maximum 10 recipients per request.",
+        success: false,
+        message: "One or more recipient email addresses are invalid.",
       });
     }
 
-    const invalidEmails = emails.filter(
-      (email) => !emailPattern.test(email)
-    );
-
-    if (invalidEmails.length > 0) {
+    if (recipientList.length > 10) {
       return res.status(400).json({
-        message: "Some email addresses are invalid.",
-        invalidEmails,
+        success: false,
+        message: "You can send a maximum of 10 recipients per request.",
       });
     }
 
-    // Save initial email history
-    record = await Email.create({
-      subject: subject.trim(),
-      body: body.trim(),
-      recipients: emails,
-      status: "pending",
+    // Save the email request in MongoDB
+    const record = await Email.create({
+      subject: emailSubject,
+      message: emailBody,
+      recipients: recipientList,
+      status: "processing",
     });
 
-    const successfulRecipients = [];
-    const failedRecipients = [];
+    const sentTo = [];
+    const failedTo = [];
 
-    // Send emails one at a time
-    for (const recipient of emails) {
+    // Send emails individually
+    for (const recipient of recipientList) {
       try {
         await transporter.sendMail({
-          from: process.env.EMAIL_USER,
+          from: `"BulkMail" <${process.env.EMAIL_USER}>`,
           to: recipient,
-          subject: subject.trim(),
-          text: body.trim(),
+          subject: emailSubject,
+          text: emailBody,
         });
 
-        successfulRecipients.push(recipient);
+        sentTo.push(recipient);
       } catch (error) {
         console.error(
-          `Email send failed for ${recipient}:`,
+          `Failed to send email to ${recipient}:`,
           error.message
         );
 
-        failedRecipients.push(recipient);
+        failedTo.push(recipient);
       }
     }
 
-    // Update delivery status
-    let status = "failed";
+    const finalStatus =
+      failedTo.length === 0
+        ? "sent"
+        : sentTo.length === 0
+        ? "failed"
+        : "partial";
 
-    if (successfulRecipients.length === emails.length) {
-      status = "sent";
-    } else if (successfulRecipients.length > 0) {
-      status = "partial";
-    }
-
-    record.successfulRecipients = successfulRecipients;
-    record.failedRecipients = failedRecipients;
-    record.status = status;
-
-    if (failedRecipients.length > 0) {
-      record.errorMessage = "One or more messages could not be sent.";
-    }
+    record.status = finalStatus;
+    record.sentTo = sentTo;
+    record.failedTo = failedTo;
 
     await record.save();
 
-    return res.status(200).json({
-      message:
-        status === "sent"
-          ? "All emails submitted successfully."
-          : status === "partial"
-          ? "Some emails were sent; others failed."
-          : "Email sending failed.",
-      status,
-      total: emails.length,
-      sent: successfulRecipients.length,
-      failed: failedRecipients.length,
-      successfulRecipients,
-      failedRecipients,
-      recordId: record._id,
-    });
+    return res
+      .status(failedTo.length === recipientList.length ? 502 : 200)
+      .json({
+        success: failedTo.length === 0,
+        message:
+          failedTo.length === 0
+            ? "All emails sent successfully."
+            : `${sentTo.length} email(s) sent; ${failedTo.length} failed.`,
+        total: recipientList.length,
+        sent: sentTo.length,
+        failed: failedTo.length,
+        sentTo,
+        failedTo,
+        historyId: record._id,
+      });
   } catch (error) {
-    console.error("Sendmail API error:", error.message);
-
-    if (record) {
-      try {
-        record.status = "failed";
-        record.errorMessage = error.message;
-        await record.save();
-      } catch (saveError) {
-        console.error("History save failed:", saveError.message);
-      }
-    }
+    console.error("Send mail error:", error.message);
 
     return res.status(500).json({
+      success: false,
       message: "Unable to process the email request.",
     });
   }
 });
 
-// Retrieve email history
+// Get email history
 app.get("/history", async (req, res) => {
   try {
     const history = await Email.find()
@@ -186,31 +188,34 @@ app.get("/history", async (req, res) => {
       .limit(100)
       .lean();
 
-    return res.json(history);
+    return res.status(200).json({
+      success: true,
+      count: history.length,
+      history,
+    });
   } catch (error) {
-    console.error("History API error:", error.message);
+    console.error("History error:", error.message);
 
     return res.status(500).json({
-      message: "Unable to load email history.",
+      success: false,
+      message: "Unable to retrieve email history.",
     });
   }
 });
 
-// Connect to MongoDB and start server
+// Start server after checking MongoDB and Gmail
 async function startServer() {
   try {
-    if (
-      !process.env.MONGO_URI ||
-      !process.env.EMAIL_USER ||
-      !process.env.EMAIL_PASS
-    ) {
-      throw new Error(
-        "Missing MONGO_URI, EMAIL_USER or EMAIL_PASS environment variable."
-      );
+    if (!process.env.MONGO_URI) {
+      throw new Error("MONGO_URI is missing from environment variables.");
+    }
+
+    if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
+      throw new Error("EMAIL_USER or EMAIL_PASS is missing.");
     }
 
     await mongoose.connect(process.env.MONGO_URI, {
-      serverSelectionTimeoutMS: 10000,
+      serverSelectionTimeoutMS: 15000,
     });
 
     console.log("MongoDB connected successfully");
@@ -218,7 +223,7 @@ async function startServer() {
     await transporter.verify();
     console.log("Gmail SMTP connection verified");
 
-    app.listen(PORT, () => {
+    app.listen(PORT, "0.0.0.0", () => {
       console.log(`BulkMail server running on port ${PORT}`);
     });
   } catch (error) {
