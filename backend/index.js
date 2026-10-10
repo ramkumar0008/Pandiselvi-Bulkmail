@@ -1,4 +1,3 @@
-
 require("dotenv").config();
 
 const express = require("express");
@@ -13,8 +12,10 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+// Email validation
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Gmail transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -23,10 +24,12 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// Home route
 app.get("/", (req, res) => {
   res.json({ message: "BulkMail API is running" });
 });
 
+// Health check
 app.get("/health", (req, res) => {
   res.json({
     server: "running",
@@ -56,7 +59,6 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
-    // Normalize and remove duplicate addresses
     const emails = [
       ...new Set(
         recipients
@@ -72,10 +74,9 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
-    // Prevent accidental mass sends; adjust to your authorized use case.
     if (emails.length > 10) {
       return res.status(400).json({
-        message: "Maximum 10 recipients per request. Send in smaller batches.",
+        message: "Maximum 10 recipients per request.",
       });
     }
 
@@ -83,7 +84,7 @@ app.post("/sendmail", async (req, res) => {
       (email) => !emailPattern.test(email)
     );
 
-    if (invalidEmails.length) {
+    if (invalidEmails.length > 0) {
       return res.status(400).json({
         message: "Some email addresses are invalid.",
         invalidEmails,
@@ -100,7 +101,6 @@ app.post("/sendmail", async (req, res) => {
     const successfulRecipients = [];
     const failedRecipients = [];
 
-    // Sequential delivery makes errors easier to track.
     for (const recipient of emails) {
       try {
         await transporter.sendMail({
@@ -112,7 +112,7 @@ app.post("/sendmail", async (req, res) => {
 
         successfulRecipients.push(recipient);
       } catch (error) {
-        console.error("Email send failed:", recipient, error.message);
+        console.error("Email send failed:", error.message);
         failedRecipients.push(recipient);
       }
     }
@@ -129,7 +129,7 @@ app.post("/sendmail", async (req, res) => {
     record.failedRecipients = failedRecipients;
     record.status = status;
 
-    if (failedRecipients.length) {
+    if (failedRecipients.length > 0) {
       record.errorMessage = "One or more messages could not be sent.";
     }
 
@@ -176,15 +176,17 @@ app.get("/history", async (req, res) => {
       .limit(100)
       .lean();
 
-    res.json(history);
+    return res.json(history);
   } catch (error) {
     console.error("History API error:", error.message);
-    res.status(500).json({
+
+    return res.status(500).json({
       message: "Unable to load email history.",
     });
   }
 });
 
+// Start server
 async function startServer() {
   try {
     if (
@@ -193,7 +195,7 @@ async function startServer() {
       !process.env.EMAIL_PASS
     ) {
       throw new Error(
-        "Set MONGO_URI, EMAIL_USER and EMAIL_PASS in .env"
+        "Missing MONGO_URI, EMAIL_USER or EMAIL_PASS environment variable."
       );
     }
 
