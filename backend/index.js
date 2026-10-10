@@ -12,10 +12,10 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-// Email validation
+// Validate email addresses
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// Gmail transporter
+// Configure Gmail
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -40,7 +40,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Send bulk email
+// Send bulk emails
 app.post("/sendmail", async (req, res) => {
   let record;
 
@@ -59,6 +59,7 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
+    // Remove duplicate and empty email addresses
     const emails = [
       ...new Set(
         recipients
@@ -74,6 +75,7 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
+    // Limit each request to 10 recipients
     if (emails.length > 10) {
       return res.status(400).json({
         message: "Maximum 10 recipients per request.",
@@ -91,6 +93,7 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
+    // Save initial email history
     record = await Email.create({
       subject: subject.trim(),
       body: body.trim(),
@@ -101,6 +104,7 @@ app.post("/sendmail", async (req, res) => {
     const successfulRecipients = [];
     const failedRecipients = [];
 
+    // Send emails one at a time
     for (const recipient of emails) {
       try {
         await transporter.sendMail({
@@ -112,11 +116,16 @@ app.post("/sendmail", async (req, res) => {
 
         successfulRecipients.push(recipient);
       } catch (error) {
-        console.error("Email send failed:", error.message);
+        console.error(
+          `Email send failed for ${recipient}:`,
+          error.message
+        );
+
         failedRecipients.push(recipient);
       }
     }
 
+    // Update delivery status
     let status = "failed";
 
     if (successfulRecipients.length === emails.length) {
@@ -146,6 +155,7 @@ app.post("/sendmail", async (req, res) => {
       total: emails.length,
       sent: successfulRecipients.length,
       failed: failedRecipients.length,
+      successfulRecipients,
       failedRecipients,
       recordId: record._id,
     });
@@ -168,7 +178,7 @@ app.post("/sendmail", async (req, res) => {
   }
 });
 
-// Email history
+// Retrieve email history
 app.get("/history", async (req, res) => {
   try {
     const history = await Email.find()
@@ -186,7 +196,7 @@ app.get("/history", async (req, res) => {
   }
 });
 
-// Start server
+// Connect to MongoDB and start server
 async function startServer() {
   try {
     if (
@@ -203,7 +213,7 @@ async function startServer() {
       serverSelectionTimeoutMS: 10000,
     });
 
-    console.log("MongoDB connected");
+    console.log("MongoDB connected successfully");
 
     await transporter.verify();
     console.log("Gmail SMTP connection verified");
