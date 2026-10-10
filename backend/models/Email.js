@@ -8,7 +8,7 @@ const emailSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    body: {
+    message: {
       type: String,
       required: true,
     },
@@ -16,25 +16,25 @@ const emailSchema = new mongoose.Schema(
       type: [String],
       required: true,
     },
-    successfulRecipients: {
+    sentTo: {
       type: [String],
       default: [],
     },
-    failedRecipients: {
+    failedTo: {
       type: [String],
       default: [],
     },
     status: {
       type: String,
-      enum: ["pending", "sent", "partial", "failed"],
-      default: "pending",
-    },
-    errorMessage: {
-      type: String,
-      default: "",
+      enum: ["processing", "sent", "partial", "failed"],
+      default: "processing",
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
-module.exports = mongoose.model("Email", emailSchema);
+module.exports =
+  mongoose.models.Email ||
+  mongoose.model("Email", emailSchema);
