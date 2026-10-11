@@ -6,7 +6,7 @@ import "./App.css";
 // Backend API URL
 const API_URL = (
   process.env.REACT_APP_API_URL ||
-  "https://pandiselvi-bulkmail-10.onrender.com/"
+  "https://pandiselvi-bulkmail-10.onrender.com"
 ).replace(/\/+$/, "");
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -24,50 +24,10 @@ function App() {
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
 
-  // Display a message to the user.
+  // Display status messages.
   const showStatus = (message, type = "info") => {
     setStatus(message);
     setStatusType(type);
-  };
-
-  // Add email addresses without duplicates.
-  const addEmails = (values) => {
-    const incoming = values
-      .flatMap((value) => String(value || "").split(/[;,\s]+/))
-      .map((email) => email.trim().toLowerCase())
-      .filter(Boolean);
-
-    const valid = incoming.filter((email) =>
-      EMAIL_REGEX.test(email)
-    );
-
-    const invalid = incoming.filter(
-      (email) => !EMAIL_REGEX.test(email)
-    );
-
-    let addedCount = 0;
-
-    setEmailList((previous) => {
-      const existing = new Set(previous);
-      const updated = [...previous];
-
-      valid.forEach((email) => {
-        if (!existing.has(email)) {
-          existing.add(email);
-          updated.push(email);
-          addedCount++;
-        }
-      });
-
-      return updated;
-    });
-
-    return {
-      validCount: valid.length,
-      invalidCount: invalid.length,
-      addedCount,
-      invalid,
-    };
   };
 
   // Add manually entered email addresses.
@@ -82,13 +42,12 @@ function App() {
       .map((email) => email.trim().toLowerCase())
       .filter(Boolean);
 
-    const invalid = incoming.filter(
-      (email) => !EMAIL_REGEX.test(email)
-    );
+    const valid = incoming.filter((email) => EMAIL_REGEX.test(email));
+    const invalid = incoming.filter((email) => !EMAIL_REGEX.test(email));
 
     const existing = new Set(emailList);
-    const newEmails = incoming.filter(
-      (email) => EMAIL_REGEX.test(email) && !existing.has(email)
+    const newEmails = [...new Set(valid)].filter(
+      (email) => !existing.has(email)
     );
 
     setEmailList((previous) => [
@@ -116,7 +75,7 @@ function App() {
     }
   };
 
-  // Import email addresses from Excel or CSV.
+  // Import addresses from Excel or CSV without changing the design.
   const handleFileUpload = async (event) => {
     const file = event.target.files?.[0];
 
@@ -147,7 +106,7 @@ function App() {
 
       const extractedEmails = rows.flatMap((row) =>
         row
-          .map((cell) => String(cell).trim())
+          .map((cell) => String(cell).trim().toLowerCase())
           .filter((cell) => EMAIL_REGEX.test(cell))
       );
 
@@ -161,26 +120,21 @@ function App() {
 
       const existing = new Set(emailList);
       const uniqueNewEmails = [
-        ...new Set(
-          extractedEmails
-            .map((email) => email.toLowerCase())
-            .filter((email) => !existing.has(email))
-        ),
-      ];
+        ...new Set(extractedEmails),
+      ].filter((email) => !existing.has(email));
 
       setEmailList((previous) => [
         ...previous,
-        ...uniqueNewEmails.filter(
-          (email) => !previous.includes(email)
-        ),
+        ...uniqueNewEmails.filter((email) => !previous.includes(email)),
       ]);
 
       showStatus(
-        `Found ${extractedEmails.length} valid address(es). Added ${uniqueNewEmails.length} new recipient(s).`,
+        `Found ${new Set(extractedEmails).size} valid address(es). Added ${uniqueNewEmails.length} new recipient(s).`,
         "success"
       );
     } catch (error) {
       console.error("File upload error:", error);
+
       showStatus(
         "Unable to read this file. Please upload a valid Excel or CSV file.",
         "error"
@@ -191,25 +145,27 @@ function App() {
     }
   };
 
-  // Remove an email address from the recipient list.
+  // Remove an email address.
   const handleRemoveEmail = (emailToRemove) => {
     setEmailList((previous) =>
       previous.filter((email) => email !== emailToRemove)
     );
   };
 
-  // Clear all recipient addresses.
+  // Clear all recipients.
   const handleClearEmails = () => {
     setEmailList([]);
     showStatus("All recipients have been removed.", "info");
   };
 
-  // Load sending history from MongoDB through the backend.
+  // Fetch email history from the backend.
   const fetchHistory = async () => {
     setLoadingHistory(true);
 
     try {
-      const response = await axios.get(`${API_URL}/history`);
+      const response = await axios.get(`${API_URL}/history`, {
+        timeout: 30000,
+      });
 
       const data = response.data;
 
@@ -229,7 +185,7 @@ function App() {
       );
 
       showStatus(
-        "Unable to load email history. Check that the backend is running.",
+        "Unable to load email history. Check your backend connection.",
         "error"
       );
     } finally {
@@ -239,7 +195,7 @@ function App() {
 
   useEffect(() => {
     fetchHistory();
-    // Load history when the component first mounts.
+    // Fetch history when the component first mounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -264,23 +220,26 @@ function App() {
       return;
     }
 
-    const recipients = [...emailList];
+    if (emailList.length > 100) {
+      showStatus(
+        "Please send to no more than 100 recipients per campaign.",
+        "error"
+      );
+      return;
+    }
 
-    setSending(true);
-    showStatus(
-      `Preparing to send emails to ${recipients.length} recipient(s)...`,
-      "info"
-    );
-
-    let totalSent = 0;
-    let totalFailed = 0;
-    let completedBatches = 0;
-
+    const recipients = [...new Set(emailList)];
     const batches = [];
 
     for (let index = 0; index < recipients.length; index += 10) {
       batches.push(recipients.slice(index, index + 10));
     }
+
+    setSending(true);
+
+    let totalSent = 0;
+    let totalFailed = 0;
+    let completedBatches = 0;
 
     try {
       for (const batch of batches) {
@@ -295,6 +254,8 @@ function App() {
             {
               emailList: batch,
               subject: subject.trim(),
+
+              // This matches the backend code that reads req.body.msg.
               msg: msg.trim(),
             },
             {
@@ -304,23 +265,31 @@ function App() {
 
           const data = response.data || {};
 
-          totalSent += Number(
-            data.sent ?? data.sentCount ?? data.sentTo?.length ?? 0
+          const sent = Number(
+            data.sent ??
+              data.sentCount ??
+              data.sentTo?.length ??
+              (data.success === true ? batch.length : 0)
           );
 
-          totalFailed += Number(
-            data.failed ?? data.failedCount ?? data.failedTo?.length ?? 0
+          const failed = Number(
+            data.failed ??
+              data.failedCount ??
+              data.failedTo?.length ??
+              0
           );
 
-          // If the backend reports a failure but does not give
-          // recipient counts, treat this batch as failed.
+          totalSent += sent;
+          totalFailed += failed;
+
+          // Do not assume success when the backend omits result counts.
           if (
             data.success === false &&
             !("failed" in data) &&
             !("failedCount" in data) &&
             !Array.isArray(data.failedTo)
           ) {
-            totalFailed += batch.length;
+            totalFailed += Math.max(batch.length - sent, 0);
           }
 
           completedBatches++;
@@ -355,17 +324,17 @@ function App() {
 
       if (totalFailed === 0 && totalSent > 0) {
         showStatus(
-          `The backend reported ${totalSent} email(s) sent successfully. Check Brevo delivery logs to confirm delivery.`,
+          `The backend reported ${totalSent} email(s) sent successfully. Check your inbox and Render logs to verify delivery.`,
           "success"
         );
       } else if (totalSent > 0) {
         showStatus(
-          `Sending completed with issues: ${totalSent} reported sent and ${totalFailed} failed. Check your backend and Brevo logs.`,
+          `Sending completed with issues: ${totalSent} reported sent and ${totalFailed} failed. Check the Gmail API and Render logs.`,
           "warning"
         );
       } else {
         showStatus(
-          `Email sending failed. ${totalFailed || recipients.length} recipient(s) were not reported as sent. Check your backend and Brevo logs.`,
+          `Email sending could not be confirmed. ${totalFailed || recipients.length} recipient(s) were not reported as sent. Check the Gmail API and Render logs.`,
           "error"
         );
       }
@@ -376,6 +345,7 @@ function App() {
     }
   };
 
+  // Determine the status displayed in history.
   const getRecordStatus = (record) => {
     const sent = Number(
       record.sentTo?.length ??
@@ -392,17 +362,21 @@ function App() {
     );
 
     if (record.status === "processing") return "processing";
+
     if (record.status === "partial" || (sent > 0 && failed > 0)) {
       return "partial";
     }
+
     if (record.status === "failed" || (failed > 0 && sent === 0)) {
       return "failed";
     }
+
     if (record.status === "sent" && failed === 0) return "sent";
 
     return record.status || "processing";
   };
 
+  // Format dates safely.
   const formatDate = (dateValue) => {
     if (!dateValue) return "—";
 
@@ -597,9 +571,7 @@ function App() {
                     disabled={sending}
                   />
 
-                  <p className="helper-text">
-                    {msg.length} characters
-                  </p>
+                  <p className="helper-text">{msg.length} characters</p>
                 </div>
 
                 <button
@@ -691,8 +663,8 @@ function App() {
                 <h3>BulkMail Backend</h3>
                 <p>
                   The application sends requests to your configured backend.
-                  Actual sending depends on the backend response and your
-                  email provider's configuration.
+                  Actual sending depends on the backend response and Gmail
+                  API configuration.
                 </p>
               </div>
 
@@ -776,7 +748,9 @@ function App() {
                       const recordStatus = getRecordStatus(record);
 
                       return (
-                        <tr key={record._id || `${record.subject}-${index}`}>
+                        <tr
+                          key={record._id || `${record.subject}-${index}`}
+                        >
                           <td>{formatDate(record.createdAt)}</td>
 
                           <td>
