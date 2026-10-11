@@ -1,7 +1,7 @@
 {
   "name": "bulkmail-backend",
   "version": "1.0.0",
-  "description": "BulkMail backend using MongoDB and Brevo API",
+  "description": "BulkMail backend using MongoDB and Gmail API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

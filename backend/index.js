@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
@@ -10,43 +9,68 @@ const Email = require("./models/Email");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Gmail environment variables
 const CLIENT_ID = process.env.GMAIL_CLIENT_ID;
 const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
 const SENDER_EMAIL = process.env.GMAIL_SENDER_EMAIL;
 
+// Basic email validation
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-// Gmail OAuth configuration
 let gmail = null;
 
+// --------------------------------------------------
+// Configure Gmail API
+// --------------------------------------------------
 function configureGmail() {
-  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+  const missing = [];
+
+  if (!CLIENT_ID) missing.push("GMAIL_CLIENT_ID");
+  if (!CLIENT_SECRET) missing.push("GMAIL_CLIENT_SECRET");
+  if (!REFRESH_TOKEN) missing.push("GMAIL_REFRESH_TOKEN");
+  if (!SENDER_EMAIL) missing.push("GMAIL_SENDER_EMAIL");
+
+  if (missing.length > 0) {
+    console.error(
+      "Missing Gmail environment variables:",
+      missing.join(", ")
+    );
+
+    gmail = null;
     return false;
   }
 
-  const oauth2Client = new google.auth.OAuth2(
-    CLIENT_ID,
-    CLIENT_SECRET,
-    "http://localhost"
-  );
+  try {
+    const oauth2Client = new google.auth.OAuth2(
+      CLIENT_ID,
+      CLIENT_SECRET,
+      "http://localhost"
+    );
 
-  oauth2Client.setCredentials({
-    refresh_token: REFRESH_TOKEN,
-  });
+    oauth2Client.setCredentials({
+      refresh_token: REFRESH_TOKEN,
+    });
 
-  gmail = google.gmail({
-    version: "v1",
-    auth: oauth2Client,
-  });
+    gmail = google.gmail({
+      version: "v1",
+      auth: oauth2Client,
+    });
 
-  return true;
+    return true;
+  } catch (error) {
+    gmail = null;
+    console.error("Gmail configuration error:", error.message);
+    return false;
+  }
 }
 
-// Normalize emails and remove duplicates
+// --------------------------------------------------
+// Normalize recipient emails and remove duplicates
+// --------------------------------------------------
 function normalizeEmails(value) {
   const items = Array.isArray(value) ? value : [value];
 
@@ -60,21 +84,21 @@ function normalizeEmails(value) {
   ];
 }
 
-// Encode an email subject safely, including non-English text
+// --------------------------------------------------
+// Encode email subject
+// --------------------------------------------------
 function encodeSubject(subject) {
   return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
 }
 
-// Send one plain-text email using the Gmail API
+// --------------------------------------------------
+// Send one email using Gmail API
+// --------------------------------------------------
 async function sendWithGmail(recipient, subject, message) {
   if (!gmail) {
     throw new Error(
-      "Gmail API is not configured. Check Gmail OAuth environment variables."
+      "Gmail API is not configured. Check Render environment variables."
     );
-  }
-
-  if (!SENDER_EMAIL) {
-    throw new Error("GMAIL_SENDER_EMAIL is missing.");
   }
 
   const safeMessage = String(message)
@@ -92,6 +116,7 @@ async function sendWithGmail(recipient, subject, message) {
     Buffer.from(safeMessage, "utf8").toString("base64"),
   ].join("\r\n");
 
+  // Gmail API requires URL-safe Base64
   const raw = Buffer.from(mimeMessage, "utf8")
     .toString("base64")
     .replace(/\+/g, "-")
@@ -106,18 +131,27 @@ async function sendWithGmail(recipient, subject, message) {
   return response.data.id || null;
 }
 
+// --------------------------------------------------
 // Home route
+// --------------------------------------------------
 app.get("/", (req, res) => {
   res.json({
     message: "BulkMail Gmail API backend is running",
   });
 });
 
+// --------------------------------------------------
 // Health check
+// --------------------------------------------------
 app.get("/health", (req, res) => {
   const databaseConnected = mongoose.connection.readyState === 1;
+
   const gmailConfigured = Boolean(
-    CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN && SENDER_EMAIL
+    gmail &&
+    CLIENT_ID &&
+    CLIENT_SECRET &&
+    REFRESH_TOKEN &&
+    SENDER_EMAIL
   );
 
   res.status(200).json({
@@ -131,7 +165,9 @@ app.get("/api/health", (req, res) => {
   res.redirect("/health");
 });
 
+// --------------------------------------------------
 // Send emails
+// --------------------------------------------------
 app.post("/sendmail", async (req, res) => {
   let record;
 
@@ -194,6 +230,15 @@ app.post("/sendmail", async (req, res) => {
       });
     }
 
+    // Avoid accepting email requests if Gmail isn't configured
+    if (!gmail) {
+      return res.status(503).json({
+        success: false,
+        message:
+          "Gmail API is not configured. Check backend environment variables.",
+      });
+    }
+
     // Save campaign history in MongoDB
     record = await Email.create({
       subject: String(subject).trim(),
@@ -204,7 +249,7 @@ app.post("/sendmail", async (req, res) => {
       status: "processing",
     });
 
-    // Send to each recipient individually
+    // Send individually to each recipient
     for (const recipient of recipients) {
       try {
         const messageId = await sendWithGmail(
@@ -225,6 +270,7 @@ app.post("/sendmail", async (req, res) => {
         console.error("Gmail sending error:", {
           recipient,
           status: error.response?.status || "unknown",
+          code: error.response?.data?.error?.status || "unknown",
           message:
             error.response?.data?.error?.message ||
             error.message ||
@@ -245,28 +291,26 @@ app.post("/sendmail", async (req, res) => {
 
     await record.save();
 
-    return res
-      .status(record.status === "sent" ? 200 : 207)
-      .json({
-        success: record.status === "sent",
-        message:
-          record.status === "sent"
-            ? "Gmail accepted all email requests."
-            : "Some emails failed. Check the backend logs.",
-        historyId: record._id,
-        status: record.status,
-        sent: record.sentTo.length,
-        failed: record.failedTo.length,
-        sentTo: record.sentTo,
-        failedTo: record.failedTo,
-      });
+    return res.status(record.status === "sent" ? 200 : 207).json({
+      success: record.status === "sent",
+      message:
+        record.status === "sent"
+          ? "Gmail accepted all email requests."
+          : "Some emails failed. Check the backend logs.",
+      historyId: record._id,
+      status: record.status,
+      sent: record.sentTo.length,
+      failed: record.failedTo.length,
+      sentTo: record.sentTo,
+      failedTo: record.failedTo,
+    });
   } catch (error) {
     console.error("Sendmail error:", error.message);
 
     if (record) {
       try {
         record.status =
-          record.sentTo.length > 0 ? "partial" : "failed";
+          record.sentTo?.length > 0 ? "partial" : "failed";
         await record.save();
       } catch (saveError) {
         console.error("History update failed:", saveError.message);
@@ -281,7 +325,9 @@ app.post("/sendmail", async (req, res) => {
   }
 });
 
+// --------------------------------------------------
 // Retrieve email history
+// --------------------------------------------------
 app.get("/history", async (req, res) => {
   try {
     const records = await Email.find()
@@ -298,7 +344,9 @@ app.get("/history", async (req, res) => {
   }
 });
 
-// Connect MongoDB and start the server
+// --------------------------------------------------
+// Connect MongoDB and start server
+// --------------------------------------------------
 async function startServer() {
   if (!process.env.MONGO_URI) {
     throw new Error("MONGO_URI is missing.");
@@ -307,15 +355,15 @@ async function startServer() {
   await mongoose.connect(process.env.MONGO_URI);
   console.log("MongoDB connected successfully");
 
-  configureGmail();
+  const configured = configureGmail();
 
-  if (gmail) {
-    console.log("Gmail API OAuth credentials loaded");
+  if (configured) {
+    console.log("Gmail API environment variables are loaded");
   } else {
-    console.warn("Gmail API is not configured; check environment variables");
+    console.warn("Gmail API is not configured");
   }
 
-  app.listen(PORT, () => {
+  app.listen(PORT, "0.0.0.0", () => {
     console.log(`BulkMail server running on port ${PORT}`);
   });
 }
