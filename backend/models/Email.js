@@ -1,3 +1,4 @@
+
 const mongoose = require("mongoose");
 
 const emailSchema = new mongoose.Schema(
@@ -6,10 +7,12 @@ const emailSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      maxlength: 200,
     },
     message: {
       type: String,
       required: true,
+      trim: true,
     },
     recipients: {
       type: [String],
@@ -27,9 +30,12 @@ const emailSchema = new mongoose.Schema(
       type: String,
       enum: ["processing", "sent", "partial", "failed"],
       default: "processing",
+      index: true,
     },
   },
   { timestamps: true }
 );
 
-module.exports = mongoose.model("Email", emailSchema);
+module.exports =
+  mongoose.models.Email ||
+  mongoose.model("Email", emailSchema);

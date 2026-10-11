@@ -1,6 +1,8 @@
+
 const express = require("express");
 const cors = require("cors");
 const mongoose = require("mongoose");
+const { google } = require("googleapis");
 require("dotenv").config();
 
 const Email = require("./models/Email");
@@ -8,80 +10,128 @@ const Email = require("./models/Email");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const CLIENT_ID = process.env.GMAIL_CLIENT_ID;
+const CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
+const SENDER_EMAIL = process.env.GMAIL_SENDER_EMAIL;
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-const API_KEY = process.env.BREVO_API_KEY;
-const SENDER_EMAIL = process.env.BREVO_SENDER_EMAIL;
-const SENDER_NAME = process.env.BREVO_SENDER_NAME || "BulkMail";
+// Gmail OAuth configuration
+let gmail = null;
 
+function configureGmail() {
+  if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+    return false;
+  }
+
+  const oauth2Client = new google.auth.OAuth2(
+    CLIENT_ID,
+    CLIENT_SECRET,
+    "http://localhost"
+  );
+
+  oauth2Client.setCredentials({
+    refresh_token: REFRESH_TOKEN,
+  });
+
+  gmail = google.gmail({
+    version: "v1",
+    auth: oauth2Client,
+  });
+
+  return true;
+}
+
+// Normalize emails and remove duplicates
 function normalizeEmails(value) {
   const items = Array.isArray(value) ? value : [value];
 
-  return [...new Set(
-    items
-      .flatMap((item) => String(item || "").split(/[,;\n\r]+/))
-      .map((email) => email.trim().toLowerCase())
-      .filter(Boolean)
-  )];
+  return [
+    ...new Set(
+      items
+        .flatMap((item) => String(item || "").split(/[,;\s]+/))
+        .map((email) => email.trim().toLowerCase())
+        .filter(Boolean)
+    ),
+  ];
 }
 
-function validEmail(email) {
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+// Encode an email subject safely, including non-English text
+function encodeSubject(subject) {
+  return `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
 }
 
-app.get("/", (req, res) => {
-  res.json({ message: "BulkMail backend is running" });
-});
-
-function healthResponse(req, res) {
-  res.json({
-    server: "running",
-    database: mongoose.connection.readyState === 1
-      ? "connected"
-      : "disconnected",
-    emailService: API_KEY && SENDER_EMAIL
-      ? "configured"
-      : "not configured",
-  });
-}
-
-app.get("/health", healthResponse);
-app.get("/api/health", healthResponse);
-
-async function sendWithBrevo(recipient, subject, message) {
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "api-key": API_KEY,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      sender: {
-        name: SENDER_NAME,
-        email: SENDER_EMAIL,
-      },
-      to: [{ email: recipient }],
-      subject,
-      textContent: message,
-    }),
-    signal: AbortSignal.timeout(20000),
-  });
-
-  const result = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    const error = new Error(
-      result.message || `Brevo returned HTTP ${response.status}`
+// Send one plain-text email using the Gmail API
+async function sendWithGmail(recipient, subject, message) {
+  if (!gmail) {
+    throw new Error(
+      "Gmail API is not configured. Check Gmail OAuth environment variables."
     );
-    error.statusCode = response.status;
-    throw error;
   }
 
-  return result.messageId || null;
+  if (!SENDER_EMAIL) {
+    throw new Error("GMAIL_SENDER_EMAIL is missing.");
+  }
+
+  const safeMessage = String(message)
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+
+  const mimeMessage = [
+    `From: BulkMail <${SENDER_EMAIL}>`,
+    `To: ${recipient}`,
+    `Subject: ${encodeSubject(subject)}`,
+    "MIME-Version: 1.0",
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.from(safeMessage, "utf8").toString("base64"),
+  ].join("\r\n");
+
+  const raw = Buffer.from(mimeMessage, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+
+  const response = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw },
+  });
+
+  return response.data.id || null;
 }
 
+// Home route
+app.get("/", (req, res) => {
+  res.json({
+    message: "BulkMail Gmail API backend is running",
+  });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  const databaseConnected = mongoose.connection.readyState === 1;
+  const gmailConfigured = Boolean(
+    CLIENT_ID && CLIENT_SECRET && REFRESH_TOKEN && SENDER_EMAIL
+  );
+
+  res.status(200).json({
+    server: "running",
+    database: databaseConnected ? "connected" : "disconnected",
+    emailService: gmailConfigured ? "configured" : "not configured",
+  });
+});
+
+app.get("/api/health", (req, res) => {
+  res.redirect("/health");
+});
+
+// Send emails
 app.post("/sendmail", async (req, res) => {
   let record;
 
@@ -89,87 +139,97 @@ app.post("/sendmail", async (req, res) => {
     const { emailList, subject, msg } = req.body || {};
 
     if (!subject || !String(subject).trim()) {
-      return res.status(400).json({ message: "Subject is required." });
+      return res.status(400).json({
+        success: false,
+        message: "Subject is required.",
+      });
+    }
+
+    if (/[\r\n]/.test(String(subject))) {
+      return res.status(400).json({
+        success: false,
+        message: "Subject contains invalid characters.",
+      });
     }
 
     if (!msg || !String(msg).trim()) {
-      return res.status(400).json({ message: "Message is required." });
+      return res.status(400).json({
+        success: false,
+        message: "Message is required.",
+      });
     }
 
-    if (
-      !Array.isArray(emailList) &&
-      typeof emailList !== "string"
-    ) {
+    if (!Array.isArray(emailList) && typeof emailList !== "string") {
       return res.status(400).json({
+        success: false,
         message: "emailList must be an array or a string.",
       });
     }
 
     const recipients = normalizeEmails(emailList);
 
-    if (!recipients.length) {
+    if (recipients.length === 0) {
       return res.status(400).json({
+        success: false,
         message: "Enter at least one recipient email address.",
       });
     }
 
     if (recipients.length > 100) {
       return res.status(400).json({
-        message: "Send no more than 100 recipients per request.",
+        success: false,
+        message: "Maximum 100 recipients per request.",
       });
     }
 
-    const invalidEmails = recipients.filter((email) => !validEmail(email));
+    const invalidEmails = recipients.filter(
+      (email) => !EMAIL_REGEX.test(email)
+    );
 
-    if (invalidEmails.length) {
+    if (invalidEmails.length > 0) {
       return res.status(400).json({
+        success: false,
         message: "Invalid email addresses found.",
         invalidEmails,
       });
     }
 
-    // Save the request first, preserving history in MongoDB.
+    // Save campaign history in MongoDB
     record = await Email.create({
       subject: String(subject).trim(),
-      message: String(msg),
+      message: String(msg).trim(),
       recipients,
       sentTo: [],
       failedTo: [],
       status: "processing",
     });
 
-    if (!API_KEY || !SENDER_EMAIL) {
-      record.failedTo = recipients;
-      record.status = "failed";
-      await record.save();
-
-      return res.status(503).json({
-        message: "Brevo is not configured. Check backend environment variables.",
-        historyId: record._id,
-        sent: 0,
-        failed: recipients.length,
-      });
-    }
-
+    // Send to each recipient individually
     for (const recipient of recipients) {
       try {
-        const messageId = await sendWithBrevo(
+        const messageId = await sendWithGmail(
           recipient,
           String(subject).trim(),
-          String(msg)
+          String(msg).trim()
         );
 
-        // Brevo accepted the API request; this does not guarantee delivery.
         record.sentTo.push(recipient);
-        console.log(`Brevo accepted email for ${recipient}: ${messageId || "accepted"}`);
+
+        console.log("Gmail accepted email:", {
+          recipient,
+          messageId: messageId || "not returned",
+        });
       } catch (error) {
         record.failedTo.push(recipient);
 
-        // Log the error, never the API key.
-        console.error(
-          `Brevo failed for ${recipient}:`,
-          error.statusCode || error.message
-        );
+        console.error("Gmail sending error:", {
+          recipient,
+          status: error.response?.status || "unknown",
+          message:
+            error.response?.data?.error?.message ||
+            error.message ||
+            "Email sending failed",
+        });
       }
 
       await record.save();
@@ -185,23 +245,28 @@ app.post("/sendmail", async (req, res) => {
 
     await record.save();
 
-    return res.status(record.status === "sent" ? 200 : 207).json({
-      message: record.status === "sent"
-        ? "Brevo accepted all email requests."
-        : "Some or all email requests failed. Check failedTo and Render logs.",
-      historyId: record._id,
-      status: record.status,
-      sent: record.sentTo.length,
-      failed: record.failedTo.length,
-      sentTo: record.sentTo,
-      failedTo: record.failedTo,
-    });
+    return res
+      .status(record.status === "sent" ? 200 : 207)
+      .json({
+        success: record.status === "sent",
+        message:
+          record.status === "sent"
+            ? "Gmail accepted all email requests."
+            : "Some emails failed. Check the backend logs.",
+        historyId: record._id,
+        status: record.status,
+        sent: record.sentTo.length,
+        failed: record.failedTo.length,
+        sentTo: record.sentTo,
+        failedTo: record.failedTo,
+      });
   } catch (error) {
     console.error("Sendmail error:", error.message);
 
     if (record) {
       try {
-        record.status = "failed";
+        record.status =
+          record.sentTo.length > 0 ? "partial" : "failed";
         await record.save();
       } catch (saveError) {
         console.error("History update failed:", saveError.message);
@@ -209,12 +274,14 @@ app.post("/sendmail", async (req, res) => {
     }
 
     return res.status(500).json({
+      success: false,
       message: "Unable to process the email request.",
       historyId: record?._id,
     });
   }
 });
 
+// Retrieve email history
 app.get("/history", async (req, res) => {
   try {
     const records = await Email.find()
@@ -224,19 +291,29 @@ app.get("/history", async (req, res) => {
     return res.json(records);
   } catch (error) {
     console.error("History error:", error.message);
+
     return res.status(500).json({
       message: "Unable to retrieve email history.",
     });
   }
 });
 
+// Connect MongoDB and start the server
 async function startServer() {
   if (!process.env.MONGO_URI) {
-    throw new Error("MONGO_URI is missing from backend environment variables.");
+    throw new Error("MONGO_URI is missing.");
   }
 
   await mongoose.connect(process.env.MONGO_URI);
   console.log("MongoDB connected successfully");
+
+  configureGmail();
+
+  if (gmail) {
+    console.log("Gmail API OAuth credentials loaded");
+  } else {
+    console.warn("Gmail API is not configured; check environment variables");
+  }
 
   app.listen(PORT, () => {
     console.log(`BulkMail server running on port ${PORT}`);
